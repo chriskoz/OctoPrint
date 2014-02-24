@@ -13,7 +13,8 @@ GCODE.ui = (function(){
         bedDimensions: undefined,
         onProgress: undefined,
         onModelLoaded: undefined,
-        onLayerSelected: undefined
+        onLayerSelected: undefined,
+        onLineChanged: undefined
     };
 
     var setProgress = function(type, progress) {
@@ -26,6 +27,7 @@ GCODE.ui = (function(){
         if (!onlyInfo) {
             var segmentCount = GCODE.renderer.getLayerNumSegments(layerNum);
             GCODE.renderer.render(layerNum, 0, segmentCount - 1);
+            updateGCodeLineDisplay(layerNum, 0, segmentCount - 1);
         }
 
         if (uiOptions["onLayerSelected"]) {
@@ -43,6 +45,25 @@ GCODE.ui = (function(){
 
     var switchCommands = function(layerNum, first, last) {
         GCODE.renderer.render(layerNum, first, last);
+        updateGCodeLineDisplay(layerNum, first, last);
+    };
+
+    var updateGCodeLineDisplay = function(layerNum, firstSegment, lastSegment) {
+        var layerLines = GCODE.gCodeReader.getGCodeLines(layerNum, firstSegment, lastSegment);
+
+        var currentLine = layerLines["last"];
+        var startLine = currentLine - 3;
+        if (startLine < 0) {
+            startLine = 0;
+        }
+
+        if (uiOptions["onLineChanged"]) {
+            uiOptions.onLineChanged({
+                currentLine: currentLine,
+                startLine: startLine,
+                lines: GCODE.gCodeReader.getLines(startLine, 7)
+            });
+        }
     };
 
     var processMessage = function(e){

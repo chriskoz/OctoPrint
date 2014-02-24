@@ -28,6 +28,13 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
     self.ui_modelInfo = ko.observable("");
     self.ui_layerInfo = ko.observable("");
 
+    self.ui_gcode_lines = ko.observable(undefined);
+    self.ui_start_line = ko.observable(undefined);
+    self.ui_current_line = ko.observable(undefined);
+    self.ui_current_line_idx = ko.computed(function() {
+        return self.ui_current_line() - self.ui_start_line();
+    });
+
     self.enableReload = ko.observable(false);
 
     self.waitForApproval = ko.observable(false);
@@ -138,6 +145,7 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
                 onProgress: self._onProgress,
                 onModelLoaded: self._onModelLoaded,
                 onLayerSelected: self._onLayerSelected,
+                onLineChanged: self._onLineChanged,
                 bed: self.settings.printer_bedDimensions(),
                 toolOffsets: self.settings.printer_extruderOffsets()
             });
@@ -323,6 +331,12 @@ function GcodeViewModel(loginStateViewModel, settingsViewModel) {
             self.layerSlider.slider("setValue", 0);
         }
     };
+
+    self._onLineChanged = function(lineInfo) {
+        self.ui_gcode_lines(lineInfo["lines"]);
+        self.ui_start_line(lineInfo["startLine"]);
+        self.ui_current_line(lineInfo["currentLine"]);
+    }
 
     self._onLayerSelected = function(layer) {
         if (!layer) {

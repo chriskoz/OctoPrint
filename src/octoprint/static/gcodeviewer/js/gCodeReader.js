@@ -209,6 +209,14 @@ GCODE.gCodeReader = (function(){
             };
         },
 
+        getLines: function(startLine, maxLines){
+            var result = [];
+            if (gcode !== undefined) {
+                result = gcode.slice(startLine, startLine+maxLines);
+            }
+            return result;
+        },
+
         getGCodeLines: function(layer, fromSegments, toSegments){
             var result = {
                 first: model[layer][fromSegments].gcodeLine,
