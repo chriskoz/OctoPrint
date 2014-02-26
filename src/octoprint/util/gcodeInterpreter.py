@@ -93,13 +93,13 @@ class gcode(object):
 				posOffset[0] += offsets[currentExtruder]["x"] if currentExtruder < len(offsets) else 0
 				posOffset[1] += offsets[currentExtruder]["y"] if currentExtruder < len(offsets) else 0
 
-				if len(currentE) <= currentExtruder:
+				if len(currentE) <= currentExtruder + 1:
 					for i in range(len(currentE), currentExtruder + 1):
 						currentE.append(0.0)
-				if len(maxExtrusion) <= currentExtruder:
+				if len(maxExtrusion) <= currentExtruder + 1:
 					for i in range(len(maxExtrusion), currentExtruder + 1):
 						maxExtrusion.append(0.0)
-				if len(totalExtrusion) <= currentExtruder:
+				if len(totalExtrusion) <= currentExtruder + 1:
 					for i in range(len(totalExtrusion), currentExtruder + 1):
 						totalExtrusion.append(0.0)
 			
