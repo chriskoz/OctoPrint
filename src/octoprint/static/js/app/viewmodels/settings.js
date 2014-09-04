@@ -6,11 +6,43 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
 
     self.api_enabled = ko.observable(undefined);
     self.api_key = ko.observable(undefined);
+    self.api_allowCrossOrigin = ko.observable(undefined);
 
     self.appearance_name = ko.observable(undefined);
     self.appearance_color = ko.observable(undefined);
 
-    self.appearance_available_colors = ko.observable(["default", "red", "orange", "yellow", "green", "blue", "violet", "black"]);
+    self.appearance_available_colors = ko.observable([
+        {key: "default", name: gettext("default")},
+        {key: "red", name: gettext("red")},
+        {key: "orange", name: gettext("orange")},
+        {key: "yellow", name: gettext("yellow")},
+        {key: "green", name: gettext("green")},
+        {key: "blue", name: gettext("blue")},
+        {key: "violet", name: gettext("violet")},
+        {key: "black", name: gettext("black")},
+    ]);
+    self.appearance_colorName = function(color) {
+        switch (color) {
+            case "red":
+                return gettext("red");
+            case "orange":
+                return gettext("orange");
+            case "yellow":
+                return gettext("yellow");
+            case "green":
+                return gettext("green");
+            case "blue":
+                return gettext("blue");
+            case "violet":
+                return gettext("violet");
+            case "black":
+                return gettext("black");
+            case "default":
+                return gettext("default");
+            default:
+                return color;
+        }
+    };
 
     self.printer_movementSpeedX = ko.observable(undefined);
     self.printer_movementSpeedY = ko.observable(undefined);
@@ -18,6 +50,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     self.printer_movementSpeedE = ko.observable(undefined);
     self.printer_invertAxes = ko.observable(undefined);
     self.printer_numExtruders = ko.observable(undefined);
+    self.printer_defaultExtrusionLength = ko.observable(undefined);
 
     self._printer_extruderOffsets = ko.observableArray([]);
     self.printer_extruderOffsets = ko.computed({
@@ -68,16 +101,22 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
 
     self.printer_bedDimensionX = ko.observable(undefined);
     self.printer_bedDimensionY = ko.observable(undefined);
+    self.printer_bedDimensionR = ko.observable(undefined);
+    self.printer_bedCircular = ko.observable(undefined);
     self.printer_bedDimensions = ko.computed({
         read: function () {
             return {
                 x: parseFloat(self.printer_bedDimensionX()),
-                y: parseFloat(self.printer_bedDimensionY())
+                y: parseFloat(self.printer_bedDimensionY()),
+                r: parseFloat(self.printer_bedDimensionR()),
+                circular: self.printer_bedCircular()
             };
         },
         write: function(value) {
             self.printer_bedDimensionX(value.x);
             self.printer_bedDimensionY(value.y);
+            self.printer_bedDimensionR(value.r);
+            self.printer_bedCircular(value.circular);
         },
         owner: self
     });
@@ -95,6 +134,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     self.feature_waitForStart = ko.observable(undefined);
     self.feature_alwaysSendChecksum = ko.observable(undefined);
     self.feature_sdSupport = ko.observable(undefined);
+    self.feature_sdAlwaysAvailable = ko.observable(undefined);
     self.feature_swallowOkAfterResend = ko.observable(undefined);
     self.feature_repetierTargetTemp = ko.observable(undefined);
 
@@ -114,6 +154,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
     self.folder_timelapse = ko.observable(undefined);
     self.folder_timelapseTmp = ko.observable(undefined);
     self.folder_logs = ko.observable(undefined);
+    self.folder_watched = ko.observable(undefined);
 
     self.cura_enabled = ko.observable(undefined);
     self.cura_path = ko.observable(undefined);
@@ -176,11 +217,12 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 if (callback) callback();
             }
         });
-    }
+    };
 
     self.fromResponse = function(response) {
         self.api_enabled(response.api.enabled);
         self.api_key(response.api.key);
+        self.api_allowCrossOrigin(response.api.allowCrossOrigin);
 
         self.appearance_name(response.appearance.name);
         self.appearance_color(response.appearance.color);
@@ -193,6 +235,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.printer_numExtruders(response.printer.numExtruders);
         self.printer_extruderOffsets(response.printer.extruderOffsets);
         self.printer_bedDimensions(response.printer.bedDimensions);
+        self.printer_defaultExtrusionLength(response.printer.defaultExtrusionLength);
 
         self.webcam_streamUrl(response.webcam.streamUrl);
         self.webcam_snapshotUrl(response.webcam.snapshotUrl);
@@ -207,6 +250,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.feature_waitForStart(response.feature.waitForStart);
         self.feature_alwaysSendChecksum(response.feature.alwaysSendChecksum);
         self.feature_sdSupport(response.feature.sdSupport);
+        self.feature_sdAlwaysAvailable(response.feature.sdAlwaysAvailable);
         self.feature_swallowOkAfterResend(response.feature.swallowOkAfterResend);
         self.feature_repetierTargetTemp(response.feature.repetierTargetTemp);
 
@@ -226,6 +270,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.folder_timelapse(response.folder.timelapse);
         self.folder_timelapseTmp(response.folder.timelapseTmp);
         self.folder_logs(response.folder.logs);
+        self.folder_watched(response.folder.watched);
 
         self.cura_enabled(response.cura.enabled);
         self.cura_path(response.cura.path);
@@ -236,13 +281,14 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
         self.system_actions(response.system.actions);
 
         self.terminalFilters(response.terminalFilters);
-    }
+    };
 
     self.saveData = function() {
         var data = {
             "api" : {
                 "enabled": self.api_enabled(),
-                "key": self.api_key()
+                "key": self.api_key(),
+                "allowCrossOrigin": self.api_allowCrossOrigin()
             },
             "appearance" : {
                 "name": self.appearance_name(),
@@ -256,7 +302,8 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 "invertAxes": self.printer_invertAxes(),
                 "numExtruders": self.printer_numExtruders(),
                 "extruderOffsets": self.printer_extruderOffsets(),
-                "bedDimensions": self.printer_bedDimensions()
+                "bedDimensions": self.printer_bedDimensions(),
+                "defaultExtrusionLength": self.printer_defaultExtrusionLength()
             },
             "webcam": {
                 "streamUrl": self.webcam_streamUrl(),
@@ -273,6 +320,7 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 "waitForStart": self.feature_waitForStart(),
                 "alwaysSendChecksum": self.feature_alwaysSendChecksum(),
                 "sdSupport": self.feature_sdSupport(),
+                "sdAlwaysAvailable": self.feature_sdAlwaysAvailable(),
                 "swallowOkAfterResend": self.feature_swallowOkAfterResend(),
                 "repetierTargetTemp": self.feature_repetierTargetTemp()
             },
@@ -291,7 +339,8 @@ function SettingsViewModel(loginStateViewModel, usersViewModel) {
                 "uploads": self.folder_uploads(),
                 "timelapse": self.folder_timelapse(),
                 "timelapseTmp": self.folder_timelapseTmp(),
-                "logs": self.folder_logs()
+                "logs": self.folder_logs(),
+                "watched": self.folder_watched()
             },
             "temperature": {
                 "profiles": self.temperature_profiles()

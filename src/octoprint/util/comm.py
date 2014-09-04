@@ -48,6 +48,7 @@ def serialList():
 			   + glob.glob("/dev/ttyAMA*") \
 			   + glob.glob("/dev/tty.usb*") \
 			   + glob.glob("/dev/cu.*") \
+			   + glob.glob("/dev/cuaU*") \
 			   + glob.glob("/dev/rfcomm*")
 
 	additionalPorts = settings().get(["serial", "additionalPorts"])
@@ -340,11 +341,11 @@ class MachineCom(object):
 	def close(self, isError = False):
 		printing = self.isPrinting() or self.isPaused()
 		if self._serial is not None:
-			self._serial.close()
 			if isError:
 				self._changeState(self.STATE_CLOSED_WITH_ERROR)
 			else:
 				self._changeState(self.STATE_CLOSED)
+			self._serial.close()
 		self._serial = None
 
 		if settings().get(["feature", "sdSupport"]):
@@ -522,6 +523,10 @@ class MachineCom(object):
 		if not self.isOperational():
 			return
 		self.sendCommand("M21")
+		if settings().getBoolean(["feature", "sdAlwaysAvailable"]):
+			self._sdAvailable = True
+			self.refreshSdFiles()
+			self._callback.mcSdStateChange(self._sdAvailable)
 
 	def releaseSdCard(self):
 		if not self.isOperational() or (self.isBusy() and self.isSdFileSelected()):
@@ -641,13 +646,29 @@ class MachineCom(object):
 
 				##~~ SD file list
 				# if we are currently receiving an sd file list, each line is just a filename, so just read it and abort processing
-				if self._sdFileList and isGcodeFileName(line.strip().lower()) and not 'End file list' in line:
-					filename = line.strip().lower()
-					if filterNonAscii(filename):
-						self._logger.warn("Got a file from printer's SD that has a non-ascii filename (%s), that shouldn't happen according to the protocol" % filename)
+				if self._sdFileList and not "End file list" in line:
+					preprocessed_line = line.strip().lower()
+					fileinfo = preprocessed_line.rsplit(None, 1)
+					if len(fileinfo) > 1:
+						# we might have extended file information here, so let's split filename and size and try to make them a bit nicer
+						filename, size = fileinfo
+						try:
+							size = int(size)
+						except ValueError:
+							# whatever that was, it was not an integer, so we'll just use the whole line as filename and set size to None
+							filename = preprocessed_line
+							size = None
 					else:
-						self._sdFiles.append(filename)
-					continue
+						# no extended file information, so only the filename is there and we set size to None
+						filename = preprocessed_line
+						size = None
+
+					if isGcodeFileName(filename):
+						if filterNonAscii(filename):
+							self._logger.warn("Got a file from printer's SD that has a non-ascii filename (%s), that shouldn't happen according to the protocol" % filename)
+						else:
+							self._sdFiles.append((filename, size))
+						continue
 
 				##~~ Temperature processing
 				if ' T:' in line or line.startswith('T:') or ' T0:' in line or line.startswith('T0:'):
@@ -661,7 +682,7 @@ class MachineCom(object):
 							t = time.time()
 							self._heatupWaitTimeLost = t - self._heatupWaitStartTime
 							self._heatupWaitStartTime = t
-				elif supportRepetierTargetTemp:
+				elif supportRepetierTargetTemp and ('TargetExtr' in line or 'TargetBed' in line):
 					matchExtr = self._regex_repetierTempExtr.match(line)
 					matchBed = self._regex_repetierTempBed.match(line)
 
@@ -699,7 +720,7 @@ class MachineCom(object):
 						# something went wrong, printer is reporting that we actually are not printing right now...
 						self._sdFilePos = 0
 						self._changeState(self.STATE_OPERATIONAL)
-				elif 'SD card ok' in line:
+				elif 'SD card ok' in line and not self._sdAvailable:
 					self._sdAvailable = True
 					self.refreshSdFiles()
 					self._callback.mcSdStateChange(self._sdAvailable)
@@ -728,6 +749,7 @@ class MachineCom(object):
 						})
 				elif 'Writing to file' in line:
 					# anwer to M28, at least on Marlin, Repetier and Sprinter: "Writing to file: %s"
+					self._printSection = "CUSTOM"
 					self._changeState(self.STATE_PRINTING)
 					line = "ok"
 				elif 'Done printing file' in line:
@@ -826,6 +848,8 @@ class MachineCom(object):
 							self._changeState(self.STATE_OPERATIONAL)
 							if self._sdAvailable:
 								self.refreshSdFiles()
+							else:
+								self.initSdCard()
 							eventManager().fire(Events.CONNECTED, {"port": self._port, "baudrate": self._baudrate})
 					else:
 						self._testingBaudrate = False
@@ -838,7 +862,9 @@ class MachineCom(object):
 						startSeen = True
 					elif "ok" in line and startSeen:
 						self._changeState(self.STATE_OPERATIONAL)
-						if not self._sdAvailable:
+						if self._sdAvailable:
+							self.refreshSdFiles()
+						else:
 							self.initSdCard()
 						eventManager().fire(Events.CONNECTED, {"port": self._port, "baudrate": self._baudrate})
 					elif time.time() > timeout:
@@ -887,7 +913,7 @@ class MachineCom(object):
 							if self._resendDelta is not None:
 								self._resendNextCommand()
 							elif not self._commandQueue.empty() and not self.isStreaming():
-								self._sendCommand(self._commandQueue.get())
+								self._sendCommand(self._commandQueue.get(), True)
 							else:
 								self._sendNext()
 						elif line.lower().startswith("resend") or line.lower().startswith("rs"):
@@ -935,7 +961,7 @@ class MachineCom(object):
 			try:
 				self._log("Connecting to: %s" % self._port)
 				if self._baudrate == 0:
-					self._serial = serial.Serial(str(self._port), 115200, timeout=0.1, writeTimeout=10000)
+					self._serial = serial.Serial(str(self._port), 115200, timeout=settings().getFloat(["serial", "timeout", "connection"]), writeTimeout=10000)
 				else:
 					self._serial = serial.Serial(str(self._port), self._baudrate, timeout=settings().getFloat(["serial", "timeout", "connection"]), writeTimeout=10000)
 			except:
@@ -993,16 +1019,16 @@ class MachineCom(object):
 				if self.isStreaming():
 					self._sendCommand("M29")
 
-					filename = self._currentFile.getFilename()
+					remote = self._currentFile.getRemoteFilename()
 					payload = {
 						"local": self._currentFile.getLocalFilename(),
-						"remote": self._currentFile.getRemoteFilename(),
+						"remote": remote,
 						"time": self.getPrintTime()
 					}
 
 					self._currentFile = None
 					self._changeState(self.STATE_OPERATIONAL)
-					self._callback.mcFileTransferDone(filename)
+					self._callback.mcFileTransferDone(remote)
 					eventManager().fire(Events.TRANSFER_DONE, payload)
 					self.refreshSdFiles()
 				else:
@@ -1196,6 +1222,14 @@ class MachineCom(object):
 		self._resendDelta = None
 
 		return None
+	def _gcode_M112(self, cmd): # It's an emergency what todo? Canceling the print should be the minimum
+		self.cancelPrint()
+		return cmd
+
+	def _gcode_M112(self, cmd): # It's an emergency what todo? Canceling the print should be the minimum
+		self.cancelPrint()
+		return cmd
+
 
 ### MachineCom callback ################################################################################################
 

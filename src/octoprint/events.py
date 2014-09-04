@@ -203,36 +203,42 @@ class DebugEventListener(GenericEventListener):
 
 
 class CommandTrigger(GenericEventListener):
-	def __init__(self, triggerType, printer):
+	def __init__(self, printer):
 		GenericEventListener.__init__(self)
 		self._printer = printer
 		self._subscriptions = {}
 
-		self._initSubscriptions(triggerType)
+		self._initSubscriptions()
 
-	def _initSubscriptions(self, triggerType):
+	def _initSubscriptions(self):
 		"""
 		Subscribes all events as defined in "events > $triggerType > subscriptions" in the settings with their
 		respective commands.
 		"""
-		if not settings().get(["events", triggerType]):
+		if not settings().get(["events"]):
 			return
 
-		if not settings().getBoolean(["events", triggerType, "enabled"]):
+		if not settings().getBoolean(["events", "enabled"]):
 			return
 
 		eventsToSubscribe = []
-		for subscription in settings().get(["events", triggerType, "subscriptions"]):
-			if not "event" in subscription.keys() or not "command" in subscription.keys():
-				self._logger.info("Invalid %s, missing either event or command: %r" % (triggerType, subscription))
+		for subscription in settings().get(["events", "subscriptions"]):
+			if not "event" in subscription.keys() or not "command" in subscription.keys() \
+					or not "type" in subscription.keys() or not subscription["type"] in ["system", "gcode"]:
+				self._logger.info("Invalid command trigger, missing either event, type or command or type is invalid: %r" % subscription)
+				continue
+
+			if "enabled" in subscription.keys() and not subscription["enabled"]:
+				self._logger.info("Disabled command trigger: %r" % subscription)
 				continue
 
 			event = subscription["event"]
 			command = subscription["command"]
+			commandType = subscription["type"]
 
 			if not event in self._subscriptions.keys():
 				self._subscriptions[event] = []
-			self._subscriptions[event].append(command)
+			self._subscriptions[event].append((command, commandType))
 
 			if not event in eventsToSubscribe:
 				eventsToSubscribe.append(event)
@@ -250,18 +256,48 @@ class CommandTrigger(GenericEventListener):
 		if not event in self._subscriptions:
 			return
 
-		for command in self._subscriptions[event]:
+		for command, commandType in self._subscriptions[event]:
 			try:
-				processedCommand = self._processCommand(command, payload)
-				self.executeCommand(processedCommand)
+				if isinstance(command, (tuple, list, set)):
+					processedCommand = []
+					for c in command:
+						processedCommand.append(self._processCommand(c, payload))
+				else:
+					processedCommand = self._processCommand(command, payload)
+				self.executeCommand(processedCommand, commandType)
 			except KeyError, e:
 				self._logger.warn("There was an error processing one or more placeholders in the following command: %s" % command)
 
-	def executeCommand(self, command):
-		"""
-		Not implemented, override in child classes
-		"""
-		pass
+	def executeCommand(self, command, commandType):
+		if commandType == "system":
+			self._executeSystemCommand(command)
+		elif commandType == "gcode":
+			self._executeGcodeCommand(command)
+
+	def _executeSystemCommand(self, command):
+		def commandExecutioner(command):
+			self._logger.info("Executing system command: %s" % command)
+			subprocess.Popen(command, shell=True)
+
+		try:
+			if isinstance(command, (list, tuple, set)):
+				for c in command:
+					commandExecutioner(c)
+			else:
+				commandExecutioner(command)
+		except subprocess.CalledProcessError, e:
+			self._logger.warn("Command failed with return code %i: %s" % (e.returncode, e.message))
+		except Exception, ex:
+			self._logger.exception("Command failed")
+
+	def _executeGcodeCommand(self, command):
+		commands = [command]
+		if isinstance(command, (list, tuple, set)):
+			self.logger.debug("Executing GCode commands: %r" % command)
+			commands = list(command)
+		else:
+			self._logger.debug("Executing GCode command: %s" % command)
+		self._printer.commands(commands)
 
 	def _processCommand(self, command, payload):
 		"""
@@ -294,42 +330,11 @@ class CommandTrigger(GenericEventListener):
 		if "job" in currentData.keys() and currentData["job"] is not None:
 			params["__filename"] = currentData["job"]["file"]["name"]
 			if "progress" in currentData.keys() and currentData["progress"] is not None \
-				and "progress" in currentData["progress"].keys() and currentData["progress"]["progress"] is not None:
-				params["__progress"] = str(round(currentData["progress"]["progress"] * 100))
+				and "completion" in currentData["progress"].keys() and currentData["progress"]["completion"] is not None:
+				params["__progress"] = str(round(currentData["progress"]["completion"] * 100))
 
 		# now add the payload keys as well
 		if isinstance(payload, dict):
 			params.update(payload)
 
 		return command.format(**params)
-
-
-class SystemCommandTrigger(CommandTrigger):
-	"""
-	Performs configured system commands for configured events.
-	"""
-
-	def __init__(self, printer):
-		CommandTrigger.__init__(self, "systemCommandTrigger", printer)
-
-	def executeCommand(self, command):
-		try:
-			self._logger.info("Executing system command: %s" % command)
-			subprocess.Popen(command, shell=True)
-		except subprocess.CalledProcessError, e:
-			self._logger.warn("Command failed with return code %i: %s" % (e.returncode, e.message))
-		except Exception, ex:
-			self._logger.exception("Command failed")
-
-
-class GcodeCommandTrigger(CommandTrigger):
-	"""
-	Sends configured GCODE commands to the printer for configured events.
-	"""
-
-	def __init__(self, printer):
-		CommandTrigger.__init__(self, "gcodeCommandTrigger", printer)
-
-	def executeCommand(self, command):
-		self._logger.debug("Executing GCode command: %s" % command)
-		self._printer.commands(command.split(","))
