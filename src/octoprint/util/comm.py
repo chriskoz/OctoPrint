@@ -13,6 +13,7 @@ import threading
 import Queue as queue
 import logging
 import serial
+import octoprint.plugin
 
 from collections import deque
 
@@ -21,8 +22,8 @@ from octoprint.util.avr_isp import ispBase
 
 from octoprint.settings import settings
 from octoprint.events import eventManager, Events
+from octoprint.filemanager import valid_file_type
 from octoprint.filemanager.destinations import FileDestinations
-from octoprint.gcodefiles import isGcodeFileName
 from octoprint.util import getExceptionString, getNewTimeout, sanitizeAscii, filterNonAscii
 from octoprint.util.virtual import VirtualPrinter
 
@@ -150,6 +151,10 @@ class MachineCom(object):
 		self._currentLine = 1
 		self._resendDelta = None
 		self._lastLines = deque([], 50)
+
+		# hooks
+		self._pluginManager = octoprint.plugin.plugin_manager()
+		self._gcode_hooks = self._pluginManager.get_hooks("octoprint.comm.protocol.gcode")
 
 		# SD status data
 		self._sdAvailable = False
@@ -402,6 +407,7 @@ class MachineCom(object):
 			else:
 				self._sendNext()
 		except:
+			self._logger.exception("Error while trying to start printing")
 			self._errorValue = getExceptionString()
 			self._changeState(self.STATE_ERROR)
 			eventManager().fire(Events.ERROR, {"error": self.getErrorString()})
@@ -663,7 +669,7 @@ class MachineCom(object):
 						filename = preprocessed_line
 						size = None
 
-					if isGcodeFileName(filename):
+					if valid_file_type(filename, "gcode"):
 						if filterNonAscii(filename):
 							self._logger.warn("Got a file from printer's SD that has a non-ascii filename (%s), that shouldn't happen according to the protocol" % filename)
 						else:
@@ -1089,6 +1095,10 @@ class MachineCom(object):
 				return
 
 			if not self.isStreaming():
+				for hook in self._gcode_hooks:
+					hook_cmd = self._gcode_hooks[hook](self, cmd)
+					if hook_cmd and isinstance(hook_cmd, basestring):
+						cmd = hook_cmd
 				gcode = self._regex_command.search(cmd)
 				if gcode:
 					gcode = gcode.group(1)

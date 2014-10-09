@@ -15,11 +15,7 @@ from octoprint.events import Events
 
 
 class PrinterStateConnection(sockjs.tornado.SockJSConnection):
-	EVENTS = [Events.UPDATED_FILES, Events.METADATA_ANALYSIS_FINISHED, Events.MOVIE_RENDERING, Events.MOVIE_DONE,
-			  Events.MOVIE_FAILED, Events.SLICING_STARTED, Events.SLICING_DONE, Events.SLICING_FAILED,
-			  Events.TRANSFER_STARTED, Events.TRANSFER_DONE]
-
-	def __init__(self, printer, gcodeManager, userManager, eventManager, session):
+	def __init__(self, printer, fileManager, analysisQueue, userManager, eventManager, session):
 		sockjs.tornado.SockJSConnection.__init__(self, session)
 
 		self._logger = logging.getLogger(__name__)
@@ -32,7 +28,8 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection):
 		self._messageBacklogMutex = threading.Lock()
 
 		self._printer = printer
-		self._gcodeManager = gcodeManager
+		self._fileManager = fileManager
+		self._analysisQueue = analysisQueue
 		self._userManager = userManager
 		self._eventManager = eventManager
 
@@ -50,11 +47,10 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection):
 		self._emit("connected", {"apikey": octoprint.server.UI_API_KEY, "version": octoprint.server.VERSION, "display_version": octoprint.server.DISPLAY_VERSION})
 
 		self._printer.registerCallback(self)
-		self._gcodeManager.registerCallback(self)
 		octoprint.timelapse.registerCallback(self)
 
 		self._eventManager.fire(Events.CLIENT_OPENED, {"remoteAddress": remoteAddress})
-		for event in PrinterStateConnection.EVENTS:
+		for event in octoprint.events.all_events():
 			self._eventManager.subscribe(event, self._onEvent)
 
 		octoprint.timelapse.notifyCallbacks(octoprint.timelapse.current)
@@ -62,11 +58,10 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection):
 	def on_close(self):
 		self._logger.info("Client connection closed")
 		self._printer.unregisterCallback(self)
-		self._gcodeManager.unregisterCallback(self)
 		octoprint.timelapse.unregisterCallback(self)
 
 		self._eventManager.fire(Events.CLIENT_CLOSED)
-		for event in PrinterStateConnection.EVENTS:
+		for event in octoprint.events.all_events():
 			self._eventManager.unsubscribe(event, self._onEvent)
 
 	def on_message(self, message):
@@ -87,9 +82,9 @@ class PrinterStateConnection(sockjs.tornado.SockJSConnection):
 			self._messageBacklog = []
 
 		data.update({
-		"temps": temperatures,
-		"logs": logs,
-		"messages": messages
+			"temps": temperatures,
+			"logs": logs,
+			"messages": messages
 		})
 		self._emit("current", data)
 

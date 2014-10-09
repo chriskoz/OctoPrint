@@ -49,8 +49,8 @@ default_settings = {
 		},
 		"uploads": {
 			"maxSize":  1 * 1024 * 1024 * 1024, # 1GB
-			"nameSuffix": ".name",
-			"pathSuffix": ".path"
+			"nameSuffix": "name",
+			"pathSuffix": "path"
 		},
 		"maxSize": 100 * 1024, # 100 KB
 	},
@@ -91,14 +91,15 @@ default_settings = {
 		"timelapse_tmp": None,
 		"logs": None,
 		"virtualSd": None,
-		"watched": None
+		"watched": None,
+		"plugins": None,
+		"slicingProfiles": None
 	},
 	"temperature": {
-		"profiles":
-			[
-				{"name": "ABS", "extruder" : 210, "bed" : 100 },
-				{"name": "PLA", "extruder" : 180, "bed" : 60 }
-			]
+		"profiles": [
+			{"name": "ABS", "extruder" : 210, "bed" : 100 },
+			{"name": "PLA", "extruder" : 180, "bed" : 60 }
+		]
 	},
 	"printerParameters": {
 		"movementSpeed": {
@@ -114,7 +115,7 @@ default_settings = {
 			{"x": 0.0, "y": 0.0}
 		],
 		"bedDimensions": {
-			"x": 200.0, "y": 200.0, "r": 100
+			"x": 200.0, "y": 200.0, "r": 100, "circular": False
 		},
 		"defaultExtrusionLength": 5
 	},
@@ -139,19 +140,25 @@ default_settings = {
 		"path": "/default/path/to/cura",
 		"config": "/default/path/to/your/cura/config.ini"
 	},
+	"slicing": {
+		"enabled": True,
+		"defaultSlicer": "cura",
+		"defaultProfiles": None
+	},
 	"events": {
-		"enabled": False,
+		"enabled": True,
 		"subscriptions": []
 	},
 	"api": {
-		"enabled": False,
-		"key": ''.join('%02X' % ord(z) for z in uuid.uuid4().bytes),
+		"enabled": True,
+		"key": None,
 		"allowCrossOrigin": False
 	},
 	"terminalFilters": [
 		{ "name": "Suppress M105 requests/responses", "regex": "(Send: M105)|(Recv: ok T\d*:)" },
 		{ "name": "Suppress M27 requests/responses", "regex": "(Send: M27)|(Recv: SD printing byte)" }
 	],
+	"plugins": {},
 	"devel": {
 		"stylesheet": "css",
 		"virtualPrinter": {
@@ -187,6 +194,10 @@ class Settings(object):
 		else:
 			self._configfile = os.path.join(self.settings_dir, "config.yaml")
 		self.load(migrate=True)
+
+		if self.get(["api", "key"]) is None:
+			self.set(["api", "key"], ''.join('%02X' % ord(z) for z in uuid.uuid4().bytes))
+			self.save(force=True)
 
 	def _init_settings_dir(self, basedir):
 		if basedir is not None:
@@ -300,19 +311,6 @@ class Settings(object):
 			self._config["events"] = newEvents
 			self.save(force=True)
 			self._logger.info("Migrated %d event subscriptions to new format and structure" % len(newEvents["subscriptions"]))
-
-		if migrate:
-			self._migrateConfig()
-
-	def _migrateConfig(self):
-		if not self._config:
-			return
-
-		dirty = False
-		for migrate in (self._migrate_event_config, self._migrate_reverse_proxy_config):
-			dirty = migrate() or dirty
-		if dirty:
-			self.save(force=True)
 
 	def _migrate_reverse_proxy_config(self):
 		if "server" in self._config.keys() and ("baseUrl" in self._config["server"] or "scheme" in self._config["server"]):
@@ -435,12 +433,13 @@ class Settings(object):
 
 	#~~ getter
 
-	def get(self, path, asdict=False):
+	def get(self, path, asdict=False, defaults=None):
 		if len(path) == 0:
 			return None
 
 		config = self._config
-		defaults = default_settings
+		if defaults is None:
+			defaults = default_settings
 
 		while len(path) > 1:
 			key = path.pop(0)
@@ -484,8 +483,8 @@ class Settings(object):
 		else:
 			return results
 
-	def getInt(self, path):
-		value = self.get(path)
+	def getInt(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 
@@ -495,8 +494,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getFloat(self, path):
-		value = self.get(path)
+	def getFloat(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 
@@ -506,8 +505,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getBoolean(self, path):
-		value = self.get(path)
+	def getBoolean(self, path, defaults=None):
+		value = self.get(path, defaults=defaults)
 		if value is None:
 			return None
 		if isinstance(value, bool):
@@ -581,12 +580,13 @@ class Settings(object):
 
 	#~~ setter
 
-	def set(self, path, value, force=False):
+	def set(self, path, value, force=False, defaults=None):
 		if len(path) == 0:
 			return
 
 		config = self._config
-		defaults = default_settings
+		if defaults is None:
+			defaults = default_settings
 
 		while len(path) > 1:
 			key = path.pop(0)
@@ -611,9 +611,9 @@ class Settings(object):
 				config[key] = value
 			self._dirty = True
 
-	def setInt(self, path, value, force=False):
+	def setInt(self, path, value, force=False, defaults=None):
 		if value is None:
-			self.set(path, None, force)
+			self.set(path, None, force=force, defaults=defaults)
 			return
 
 		try:
@@ -624,9 +624,9 @@ class Settings(object):
 
 		self.set(path, intValue, force)
 
-	def setFloat(self, path, value, force=False):
+	def setFloat(self, path, value, force=False, defaults=None):
 		if value is None:
-			self.set(path, None, force)
+			self.set(path, None, force=force, defaults=defaults)
 			return
 
 		try:
@@ -637,13 +637,13 @@ class Settings(object):
 
 		self.set(path, floatValue, force)
 
-	def setBoolean(self, path, value, force=False):
+	def setBoolean(self, path, value, force=False, defaults=None):
 		if value is None or isinstance(value, bool):
-			self.set(path, value, force)
+			self.set(path, value, force=force, defaults=defaults)
 		elif value.lower() in valid_boolean_trues:
-			self.set(path, True, force)
+			self.set(path, True, force=force, defaults=defaults)
 		else:
-			self.set(path, False, force)
+			self.set(path, False, force=force, defaults=defaults)
 
 	def setBaseFolder(self, type, path, force=False):
 		if type not in default_settings["folder"].keys():
