@@ -6,8 +6,6 @@ __license__ = 'GNU Affero General Public License http://www.gnu.org/licenses/agp
 __copyright__ = "Copyright (C) 2014 The OctoPrint Project - Released under terms of the AGPLv3 License"
 
 
-from . import s
-
 import re
 
 class SupportLocationTypes(object):
@@ -46,7 +44,6 @@ defaults = dict(
     layer_height=0.1,
     wall_thickness=0.8,
     solid_layer_thickness=0.6,
-    nozzle_size=0.4,
     print_temperature=[220, 0, 0, 0],
     print_bed_temperature=70,
     platform_adhesion=PlatformAdhesionTypes.NONE,
@@ -349,8 +346,12 @@ class Profile(object):
 
 	@classmethod
 	def from_cura_ini(cls, path):
+		import logging
+		logger = logging.getLogger("octoprint.plugin.cura.profile")
+
 		import os
 		if not os.path.exists(path) or not os.path.isfile(path):
+			logger.warn("Path {path} does not exist or is not a file, cannot import".format(**locals()))
 			return None
 
 		import ConfigParser
@@ -358,6 +359,7 @@ class Profile(object):
 		try:
 			config.read(path)
 		except:
+			logger.exception("Error while reading profile INI file from {path}".format(**locals()))
 			return None
 
 		arrayified_options = ["print_temperature", "filament_diameter", "start.gcode", "end.gcode"]
@@ -457,74 +459,92 @@ class Profile(object):
 
 	@classmethod
 	def merge_profile(cls, profile, overrides=None):
-		import copy
-
-		result = copy.deepcopy(defaults)
-		for k in result.keys():
-			profile_value = None
-			override_value = None
-
-			if k in profile:
-				profile_value = profile[k]
-			if overrides and k in overrides:
-				override_value = overrides[k]
-
-			if profile_value is None and override_value is None:
-				# neither override nor profile, no need to handle this key further
-				continue
-
-			if k in ("filament_diameter", "print_temperature", "start_gcode", "end_gcode"):
-				# the array fields need some special treatment. Basically something like this:
-				#
-				#    override_value: [None, "b"]
-				#    profile_value : ["a" , None, "c"]
-				#    default_value : ["d" , "e" , "f", "g"]
-				#
-				# should merge to something like this:
-				#
-				#                    ["a" , "b" , "c", "g"]
-				#
-				# So override > profile > default, if neither override nor profile value are available
-				# the default value should just be left as is
-
-				for x in xrange(len(result[k])):
-					if override_value is not None and  x < len(override_value) and override_value[x] is not None:
-						# we have an override value for this location, so we use it
-						result[k][x] = override_value[x]
-					elif profile_value is not None and x < len(profile_value) and profile_value[x] is not None:
-						# we have a profile value for this location, so we use it
-						result[k][x] = profile_value[x]
-
-			else:
-				# just change the result value to the override_value if available, otherwise to the profile_value if
-				# that is given, else just leave as is
-				if override_value is not None:
-					result[k] = override_value
-				elif profile_value is not None:
-					result[k] = profile_value
+		result = dict()
+		for key in defaults.keys():
+			r = cls.merge_profile_key(key, profile, overrides=overrides)
+			if r is not None:
+				result[key] = r
 		return result
 
-	def __init__(self, profile):
-		self.profile = profile
+	@classmethod
+	def merge_profile_key(cls, key, profile, overrides=None):
+		profile_value = None
+		override_value = None
+
+		if not key in defaults:
+			return None
+		import copy
+		result = copy.deepcopy(defaults[key])
+
+		if key in profile:
+			profile_value = profile[key]
+		if overrides and key in overrides:
+			override_value = overrides[key]
+
+		if profile_value is None and override_value is None:
+			# neither override nor profile, no need to handle this key further
+			return None
+
+		if key in ("filament_diameter", "print_temperature", "start_gcode", "end_gcode"):
+			# the array fields need some special treatment. Basically something like this:
+			#
+			#    override_value: [None, "b"]
+			#    profile_value : ["a" , None, "c"]
+			#    default_value : ["d" , "e" , "f", "g"]
+			#
+			# should merge to something like this:
+			#
+			#                    ["a" , "b" , "c", "g"]
+			#
+			# So override > profile > default, if neither override nor profile value are available
+			# the default value should just be left as is
+
+			for x in xrange(len(result)):
+				if override_value is not None and  x < len(override_value) and override_value[x] is not None:
+					# we have an override value for this location, so we use it
+					result[x] = override_value[x]
+				elif profile_value is not None and x < len(profile_value) and profile_value[x] is not None:
+					# we have a profile value for this location, so we use it
+					result[x] = profile_value[x]
+
+		else:
+			# just change the result value to the override_value if available, otherwise to the profile_value if
+			# that is given, else just leave as is
+			if override_value is not None:
+				result = override_value
+			elif profile_value is not None:
+				result = profile_value
+
+		return result
+
+	def __init__(self, profile, printer_profile, posX, posY, overrides=None):
+		self._profile = self.__class__.merge_profile(profile, overrides=overrides)
+		self._printer_profile = printer_profile
+		self._posX = posX
+		self._posY = posY
+
+	def profile(self):
+		import copy
+		return copy.deepcopy(self._profile)
 
 	def get(self, key):
 		if key in ("machine_width", "machine_depth", "machine_center_is_zero"):
-			bedDimensions = s.globalGet(["printerParameters", "bedDimensions"])
-			circular = bedDimensions["circular"]
 			if key == "machine_width":
-				return bedDimensions["radius"] * 2 if circular else bedDimensions["x"]
+				return self._printer_profile["volume"]["width"]
 			elif key == "machine_depth":
-				return bedDimensions["radius"] * 2 if circular else bedDimensions["y"]
+				return self._printer_profile["volume"]["depth"]
+			elif key == "machine_height":
+				return self._printer_profile["volume"]["height"]
 			elif key == "machine_center_is_zero":
-				return circular
+				return self._printer_profile["volume"]["formFactor"] == "circular" or self._printer_profile["volume"]["origin"] == "center"
 			else:
 				return None
 
 		elif key == "extruder_amount":
-			return s.globalGetInt(["printerParameters", "numExtruders"])
+			return self._printer_profile["extruder"]["count"]
 
 		elif key.startswith("extruder_offset_"):
-			extruder_offsets = s.globalGet(["printerParameters", "extruderOffsets"])
+			extruder_offsets = self._printer_profile["extruder"]["offsets"]
 			match = Profile.regex_extruder_offset.match(key)
 			if not match:
 				return 0.0
@@ -537,16 +557,23 @@ class Profile(object):
 				return 0.0
 			if number >= len(extruder_offsets):
 				return 0.0
-			if not axis in extruder_offsets[number]:
+
+			if axis == "x":
+				return extruder_offsets[number][0]
+			elif axis == "y":
+				return extruder_offsets[number][1]
+			else:
 				return 0.0
-			return extruder_offsets[number][axis]
+
+		elif key == "has_heated_bed":
+			return self._printer_profile["heatedBed"]
 
 		elif key.startswith("filament_diameter"):
 			match = Profile.regex_filament_diameter.match(key)
 			if not match:
 				return 0.0
 
-			diameters = defaults["filament_diameter"]
+			diameters = self._get("filament_diameter")
 			if not match.group(1):
 				return diameters[0]
 			index = int(match.group(1))
@@ -559,7 +586,7 @@ class Profile(object):
 			if not match:
 				return 0.0
 
-			temperatures = defaults["print_temperature"]
+			temperatures = self._get("print_temperature")
 			if not match.group(1):
 				return temperatures[0]
 			index = int(match.group(1))
@@ -568,12 +595,15 @@ class Profile(object):
 			return temperatures[index]
 
 		else:
-			if key in self.profile:
-				return self.profile[key]
-			elif key in defaults:
-				return defaults[key]
-			else:
-				return None
+			return self._get(key)
+
+	def _get(self, key):
+		if key in self._profile:
+			return self._profile[key]
+		elif key in defaults:
+			return defaults[key]
+		else:
+			return None
 
 	def get_int(self, key, default=None):
 		value = self.get(key)
@@ -619,10 +649,10 @@ class Profile(object):
 		return int(value * 1000)
 
 	def get_gcode_template(self, key):
-		extruder_count = s.globalGetInt(["printerParameters", "numExtruders"])
+		extruder_count = self.get_int("extruder_amount")
 
-		if key in self.profile:
-			gcode = self.profile[key]
+		if key in self._profile:
+			gcode = self._profile[key]
 		else:
 			gcode = defaults[key]
 
@@ -631,21 +661,13 @@ class Profile(object):
 		else:
 			return gcode
 
-	def get_machine_extruder_offset(self, extruder, axis):
-		extruder_offsets = s.globalGet(["printerParameters", "extruderOffsets"])
-		if extruder >= len(extruder_offsets):
-			return 0.0
-		if axis.lower() not in ("x", "y"):
-			return 0.0
-		return extruder_offsets[extruder][axis.lower()]
-
 	def get_profile_string(self):
 		import base64
 		import zlib
 
 		import copy
 		profile = copy.deepcopy(defaults)
-		profile.update(self.profile)
+		profile.update(self._profile)
 		for key in ("print_temperature", "print_temperature2", "print_temperature3", "print_temperature4",
 		            "filament_diameter", "filament_diameter2", "filament_diameter3", "filament_diameter4"):
 			profile[key] = self.get(key)
@@ -689,7 +711,7 @@ class Profile(object):
 		return pre + str(f)
 
 	def get_gcode(self, key):
-		extruder_count = s.globalGetInt(["printerParameters", "numExtruders"])
+		extruder_count = self.get_int("extruder_amount")
 
 		prefix = ""
 		postfix = ""
@@ -707,13 +729,13 @@ class Profile(object):
 				prefix += "M92 E{e_steps}\n" % (e_steps)
 			temp = self.get_float("print_temperature")
 
-			bedTemp = 0
+			bed_temp = 0
 			if self.get_boolean("has_heated_bed"):
-				bedTemp = self.get_float("print_bed_temperature")
-			include_bed_temps = bedTemp > 0 and not "{print_bed_temperature}" in Profile.regex_strip_comments.sub("", contents)
+				bed_temp = self.get_float("print_bed_temperature")
+			include_bed_temp = bed_temp > 0 and not "{print_bed_temperature}" in Profile.regex_strip_comments.sub("", contents)
 
-			if include_bed_temps:
-				prefix += "M140 S{print_bed_temperature}\n"
+			if include_bed_temp:
+				prefix += "M140 S{bed_temp}\n".format(bed_temp=bed_temp)
 
 			if temp > 0 and not "{print_temperature}" in Profile.regex_strip_comments.sub("", contents):
 				if extruder_count > 0:
@@ -724,16 +746,19 @@ class Profile(object):
 							if print_temp > 0:
 								t = print_temp
 						return template.format(extruder=extruder, temp=t)
-					for n in xrange(1, extruder_count):
-						prefix += temp_line(temp, n, "M104 T{extruder} S{temp}\n")
+
+					prefix_preheat = ""
+					prefix_waitheat = ""
 					for n in xrange(0, extruder_count):
-						prefix += temp_line(temp, n, "M109 T{extruder} S{temp}\n")
-					prefix += "T0\n"
+						if n > 0:
+							prefix_preheat += temp_line(temp, n, "M104 T{extruder} S{temp}\n")
+						prefix_waitheat += temp_line(temp, n, "M109 T{extruder} S{temp}\n")
+					prefix += prefix_preheat + prefix_waitheat + "T0\n"
 				else:
 					prefix += "M109 S{temp}\n".format(temp=temp)
 
-			if include_bed_temps:
-				prefix += "M190 S{print_bed_temperature}\n".format(bedTemp=bedTemp)
+			if include_bed_temp:
+				prefix += "M190 S{bed_temp}\n".format(bed_temp=bed_temp)
 
 		else:
 			contents = self.get_gcode_template(key)
@@ -742,7 +767,7 @@ class Profile(object):
 
 	def calculate_edge_width_and_line_count(self):
 		wall_thickness = self.get_float("wall_thickness")
-		nozzle_size = self.get_float("nozzle_size")
+		nozzle_size = self._printer_profile["extruder"]["nozzleDiameter"]
 
 		if self.get_boolean("spiralize") or self.get_boolean("follow_surface"):
 			return wall_thickness, 1
@@ -773,7 +798,7 @@ class Profile(object):
 		return int(math.ceil(solid_thickness / (layer_height - 0.0001)))
 
 	def calculate_minimal_extruder_count(self):
-		extruder_count = s.globalGetInt(["printerParameters", "numExtruders"])
+		extruder_count = self.get("extruder_amount")
 		if extruder_count < 2:
 			return 1
 		if self.get("support") == SupportLocationTypes.NONE:
@@ -782,12 +807,30 @@ class Profile(object):
 			return 2
 		return 1
 
+	def get_pos_x(self):
+		if self._posX:
+			try:
+				return int(float(self._posX) * 1000)
+			except ValueError:
+				pass
+
+		return int(self.get_float("machine_width") / 2.0 * 1000) if not self.get_boolean("machine_center_is_zero") else 0.0
+
+	def get_pos_y(self):
+		if self._posY:
+			try:
+				return int(float(self._posY) * 1000)
+			except ValueError:
+				pass
+
+		return int(self.get_float("machine_depth") / 2.0 * 1000) if not self.get_boolean("machine_center_is_zero") else 0.0
+
 	def convert_to_engine(self):
 
 		edge_width, line_count = self.calculate_edge_width_and_line_count()
 		solid_layer_count = self.calculate_solid_layer_count()
 
-		extruder_count = s.globalGetInt(["printerParameters", "numExtruders"])
+		extruder_count = self.get_int("extruder_amount")
 		minimal_extruder_count = self.calculate_minimal_extruder_count()
 
 		settings = {
@@ -830,8 +873,8 @@ class Profile(object):
 			"coolHeadLift": 1 if self.get_boolean("cool_head_lift") else 0,
 
 			# model positioning
-			"posx": int(self.get_float("machine_width") / 2.0 * 1000) if not self.get_boolean("machine_center_is_zero") else 0.0,
-			"posy": int(self.get_float("machine_depth") / 2.0 * 1000) if not self.get_boolean("machine_center_is_zero") else 0.0,
+			"posx": self.get_pos_x(),
+			"posy": self.get_pos_y(),
 
 			# gcodes
 			"startCode": self.get_gcode("start_gcode"),
@@ -845,7 +888,7 @@ class Profile(object):
 
 		for extruder in range(1, extruder_count):
 			for axis in ("x", "y"):
-				settings["extruderOffset[{extruder}].{axis}".format(extruder=extruder, axis=axis.upper())] = self.get_machine_extruder_offset(extruder, axis)
+				settings["extruderOffset[{extruder}].{axis}".format(extruder=extruder, axis=axis.upper())] = self.get("extruder_offset_{axis}{extruder}".format(extruder=extruder, axis=axis.lower()))
 
 		fanFullHeight = self.get_microns("fan_full_height")
 		settings["fanFullOnLayerNr"] = (fanFullHeight - settings["initialLayerThickness"] - 1) / settings["layerThickness"] + 1

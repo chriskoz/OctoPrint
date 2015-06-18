@@ -4,6 +4,7 @@ $(function() {
 
         self.loginState = parameters[0];
         self.settingsViewModel = parameters[1];
+        self.slicingViewModel = parameters[2];
 
         self.fileName = ko.observable();
 
@@ -70,6 +71,7 @@ $(function() {
                 self.placeholderDisplayName(name);
                 self.placeholderDescription("Imported from " + self.fileName() + " on " + formatDate(new Date().getTime() / 1000));
 
+                self.uploadButton.unbind("click");
                 self.uploadButton.on("click", function() {
                     var form = {
                         allowOverwrite: self.profileAllowOverwrite()
@@ -99,8 +101,9 @@ $(function() {
                 self.profileDescription(undefined);
                 self.profileAllowOverwrite(true);
 
-                $("#settings-plugin-cura-import").modal("hide");
+                $("#settings_plugin_cura_import").modal("hide");
                 self.requestData();
+                self.slicingViewModel.requestData();
             }
         });
 
@@ -118,6 +121,7 @@ $(function() {
                 type: "DELETE",
                 success: function() {
                     self.requestData();
+                    self.slicingViewModel.requestData();
                 }
             });
         };
@@ -180,9 +184,12 @@ $(function() {
             self.settings = self.settingsViewModel.settings;
             self.requestData();
         };
-
     }
 
     // view model class, parameters for constructor, container to bind to
-    ADDITIONAL_VIEWMODELS.push([CuraViewModel, ["loginStateViewModel", "settingsViewModel"], document.getElementById("settings_plugin_cura_dialog")]);
+    OCTOPRINT_VIEWMODELS.push([
+        CuraViewModel,
+        ["loginStateViewModel", "settingsViewModel", "slicingViewModel"],
+        "#settings_plugin_cura"
+    ]);
 });
