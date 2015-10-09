@@ -19,6 +19,7 @@ import uuid
 import threading
 import logging
 import netaddr
+import os
 
 from octoprint.settings import settings
 import octoprint.server
@@ -122,12 +123,19 @@ def enable_additional_translations(default_locale="en", additional_folders=None)
 
 def fix_webassets_cache():
 	from webassets import cache
-	import os
-	import tempfile
-	import pickle
-	import shutil
+
+	error_logger = logging.getLogger(__name__ + ".fix_webassets_cache")
 
 	def fixed_set(self, key, data):
+		import os
+		import tempfile
+		import pickle
+		import shutil
+
+		if not os.path.exists(self.directory):
+			error_logger.warn("Cache directory {} doesn't exist, not going "
+			                  "to attempt to write cache file".format(self.directory))
+
 		md5 = '%s' % cache.make_md5(self.V, key)
 		filename = os.path.join(self.directory, md5)
 		fd, temp_filename = tempfile.mkstemp(prefix='.' + md5,
@@ -146,6 +154,11 @@ def fix_webassets_cache():
 		import errno
 		import warnings
 		from webassets.cache import make_md5
+
+		if not os.path.exists(self.directory):
+			error_logger.warn("Cache directory {} doesn't exist, not going "
+			                  "to attempt to read cache file".format(self.directory))
+			return None
 
 		try:
 			hash = make_md5(self.V, key)
@@ -174,6 +187,37 @@ def fix_webassets_cache():
 	cache.FilesystemCache.set = fixed_set
 	cache.FilesystemCache.get = fixed_get
 
+def fix_webassets_filtertool():
+	from webassets.merge import FilterTool, log, MemoryHunk
+
+	error_logger = logging.getLogger(__name__ + ".fix_webassets_filtertool")
+
+	def fixed_wrap_cache(self, key, func):
+		"""Return cache value ``key``, or run ``func``.
+		"""
+		if self.cache:
+			if not self.no_cache_read:
+				log.debug('Checking cache for key %s', key)
+				content = self.cache.get(key)
+				if not content in (False, None):
+					log.debug('Using cached result for %s', key)
+					return MemoryHunk(content)
+
+		try:
+			content = func().getvalue()
+			if self.cache:
+				try:
+					log.debug('Storing result in cache with key %s', key,)
+					self.cache.set(key, content)
+				except:
+					error_logger.exception("Got an exception while trying to save file to cache, not caching")
+			return MemoryHunk(content)
+		except:
+			error_logger.exception("Got an exception while trying to apply filter, ignoring file")
+			return MemoryHunk(u"")
+
+	FilterTool._wrap_cache = fixed_wrap_cache
+
 #~~ passive login helper
 
 def passive_login():
@@ -183,8 +227,10 @@ def passive_login():
 		user = flask.ext.login.current_user
 
 	if user is not None and not user.is_anonymous():
-		flask.g.user = user
 		flask.ext.principal.identity_changed.send(flask.current_app._get_current_object(), identity=flask.ext.principal.Identity(user.get_id()))
+		if hasattr(user, "get_session"):
+			flask.session["usersession.id"] = user.get_session()
+		flask.g.user = user
 		return flask.jsonify(user.asDict())
 	elif settings().getBoolean(["accessControl", "autologinLocal"]) \
 			and settings().get(["accessControl", "autologinAs"]) is not None \
@@ -208,14 +254,14 @@ def passive_login():
 			logger = logging.getLogger(__name__)
 			logger.exception("Could not autologin user %s for networks %r" % (autologinAs, localNetworks))
 
-	return ("", 204)
+	return "", 204
 
 
 #~~ cache decorator for cacheable views
 
 _cache = SimpleCache()
 
-def cached(timeout=5 * 60, key=lambda: "view/%s" % flask.request.path, unless=None, refreshif=None):
+def cached(timeout=5 * 60, key=lambda: "view/%s" % flask.request.path, unless=None, refreshif=None, unless_response=None):
 	def decorator(f):
 		@functools.wraps(f)
 		def decorated_function(*args, **kwargs):
@@ -237,12 +283,17 @@ def cached(timeout=5 * 60, key=lambda: "view/%s" % flask.request.path, unless=No
 			if not callable(refreshif) or not refreshif():
 				rv = _cache.get(cache_key)
 				if rv is not None:
-					logger.debug("Serving entry for {path} from cache".format(path=flask.request.path))
+					logger.debug("Serving entry for {path} from cache (key: {key})".format(path=flask.request.path, key=cache_key))
 					return rv
 
 			# get value from wrapped function
-			logger.debug("No cache entry or refreshing cache for {path}, calling wrapped function".format(path=flask.request.path))
+			logger.debug("No cache entry or refreshing cache for {path} (key: {key}), calling wrapped function".format(path=flask.request.path, key=cache_key))
 			rv = f(*args, **kwargs)
+
+			# do not store if the "unless_response" condition is true
+			if callable(unless_response) and unless_response(rv):
+				logger.debug("Not caching result for {path}, bypassed".format(path=flask.request.path))
+				return rv
 
 			# store it in the cache
 			_cache.set(cache_key, rv, timeout=timeout)
@@ -255,6 +306,31 @@ def cached(timeout=5 * 60, key=lambda: "view/%s" % flask.request.path, unless=No
 
 def cache_check_headers():
 	return "no-cache" in flask.request.cache_control or "no-cache" in flask.request.pragma
+
+def cache_check_response_headers(response):
+	if not isinstance(response, flask.Response):
+		return False
+
+	headers = response.headers
+
+	if "Cache-Control" in headers and "no-cache" in headers["Cache-Control"]:
+		return True
+
+	if "Pragma" in headers and "no-cache" in headers["Pragma"]:
+		return True
+
+	if "Expires" in headers and headers["Expires"] in ("0", "-1"):
+		return True
+
+	return False
+
+
+def add_non_caching_response_headers(response):
+	response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0"
+	response.headers["Pragma"] = "no-cache"
+	response.headers["Expires"] = "-1"
+	return response
+
 
 #~~ access validators for use with tornado
 
@@ -302,7 +378,7 @@ def _get_flask_user_from_request(request):
 	from octoprint.settings import settings
 
 	apikey = octoprint.server.util.get_api_key(request)
-	if settings().get(["api", "enabled"]) and apikey is not None:
+	if settings().getBoolean(["api", "enabled"]) and apikey is not None:
 		user = octoprint.server.util.get_user_for_apikey(apikey)
 	else:
 		user = flask.ext.login.current_user
@@ -454,7 +530,8 @@ def get_remote_address(request):
 
 
 def get_json_command_from_request(request, valid_commands):
-	if not "application/json" in request.headers["Content-Type"]:
+	content_type = request.headers.get("Content-Type", None)
+	if content_type is None or not "application/json" in content_type:
 		return None, None, make_response("Expected content-type JSON", 400)
 
 	data = request.json
@@ -534,7 +611,9 @@ class SettingsCheckUpdater(webassets.updater.BaseUpdater):
 
 ##~~ plugin assets collector
 
-def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, preferred_stylesheet="css"):
+def collect_plugin_assets(enable_gcodeviewer=True, preferred_stylesheet="css"):
+	logger = logging.getLogger(__name__ + ".collect_plugin_assets")
+
 	supported_stylesheets = ("css", "less")
 	assets = dict(
 		js=[],
@@ -545,7 +624,6 @@ def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, prefer
 		'js/app/viewmodels/appearance.js',
 		'js/app/viewmodels/connection.js',
 		'js/app/viewmodels/control.js',
-		'js/app/viewmodels/firstrun.js',
 		'js/app/viewmodels/files.js',
 		'js/app/viewmodels/loginstate.js',
 		'js/app/viewmodels/navigation.js',
@@ -553,11 +631,15 @@ def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, prefer
 		'js/app/viewmodels/printerprofiles.js',
 		'js/app/viewmodels/settings.js',
 		'js/app/viewmodels/slicing.js',
+		'js/app/viewmodels/system.js',
 		'js/app/viewmodels/temperature.js',
 		'js/app/viewmodels/terminal.js',
+		'js/app/viewmodels/timelapse.js',
 		'js/app/viewmodels/users.js',
 		'js/app/viewmodels/log.js',
-		'js/app/viewmodels/usersettings.js'
+		'js/app/viewmodels/usersettings.js',
+		'js/app/viewmodels/wizard.js',
+		'js/app/viewmodels/about.js'
 	]
 	if enable_gcodeviewer:
 		assets["js"] += [
@@ -566,8 +648,6 @@ def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, prefer
 			'gcodeviewer/js/gCodeReader.js',
 			'gcodeviewer/js/renderer.js'
 		]
-	if enable_timelapse:
-		assets["js"].append('js/app/viewmodels/timelapse.js')
 
 	if preferred_stylesheet == "less":
 		assets["less"].append('less/octoprint.less')
@@ -577,14 +657,29 @@ def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, prefer
 	asset_plugins = octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.AssetPlugin)
 	for implementation in asset_plugins:
 		name = implementation._identifier
-		all_assets = implementation.get_assets()
+		try:
+			all_assets = implementation.get_assets()
+			basefolder = implementation.get_asset_folder()
+		except:
+			logger.exception("Got an error while trying to collect assets from {}, ignoring assets from the plugin".format(name))
+			continue
+
+		def asset_exists(category, asset):
+			exists = os.path.exists(os.path.join(basefolder, asset))
+			if not exists:
+				logger.warn("Plugin {} is referring to non existing {} asset {}".format(name, category, asset))
+			return exists
 
 		if "js" in all_assets:
 			for asset in all_assets["js"]:
+				if not asset_exists("js", asset):
+					continue
 				assets["js"].append('plugin/{name}/{asset}'.format(**locals()))
 
 		if preferred_stylesheet in all_assets:
 			for asset in all_assets[preferred_stylesheet]:
+				if not asset_exists(preferred_stylesheet, asset):
+					continue
 				assets[preferred_stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
 		else:
 			for stylesheet in supported_stylesheets:
@@ -592,6 +687,8 @@ def collect_plugin_assets(enable_gcodeviewer=True, enable_timelapse=True, prefer
 					continue
 
 				for asset in all_assets[stylesheet]:
+					if not asset_exists(stylesheet, asset):
+						continue
 					assets[stylesheet].append('plugin/{name}/{asset}'.format(**locals()))
 				break
 

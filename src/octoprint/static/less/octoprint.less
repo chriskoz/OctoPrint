@@ -387,19 +387,21 @@ ul.dropdown-menu li a {
   width: 100%;
 }
 
-/** Offline overlay */
+/** Offline & Reload overlay */
 
-#offline_overlay {
+#offline_overlay,
+#reloadui_overlay {
   position: fixed;
   top: 0;
   left: 0;
   width: 100%;
   height: 100%;
-  z-index: 10000;
+  z-index: 10001;
   display: none;
 }
 
-#offline_overlay_background {
+#offline_overlay_background,
+#reloadui_overlay_background {
   position: fixed;
   top: 0;
   left: 0;
@@ -412,7 +414,8 @@ ul.dropdown-menu li a {
   opacity: 0.5;
 }
 
-#offline_overlay_wrapper {
+#offline_overlay_wrapper,
+#reloadui_overlay_wrapper {
   position: absolute;
   top: 0;
   bottom: 0;
@@ -433,28 +436,6 @@ ul.dropdown-menu li a {
   outline: none;
 
   //min-height: 440px;
-
-  .flipH {
-    -webkit-transform: scaleX(-1);
-    -moz-transform: scaleX(-1);
-    -ms-transform: scaleX(-1);
-  }
-
-  .flipV {
-    -webkit-transform: scaleY(-1);
-    -moz-transform: scaleY(-1);
-    -ms-transform: scaleY(-1);
-  }
-
-  .flipH.flipV {
-    -webkit-transform: scaleX(-1) scaleY(-1);
-    -moz-transform: scaleX(-1) scaleY(-1);
-    -ms-transform: scaleX(-1) scaleY(-1);
-  }
-
-  .rotate90 {
-    transform: rotate(-90deg);
-  }
 
   .keycontrol_overlay {
     position: absolute;
@@ -608,11 +589,11 @@ ul.dropdown-menu li a {
     }
   }
 
-  .custom_section_horizontal .custom_control {
+  .custom_section_horizontal > .custom_control {
     display: inline-block;
   }
 
-  .custom_section_vertical .custom_control {
+  .custom_section_vertical > .custom_control {
       display:block;
   }
 
@@ -682,14 +663,17 @@ ul.dropdown-menu li a {
   }
 }
 
-/** Settings dialog */
-#settings_dialog {
-  .modal-body {
-    #settings_dialog_menu {
-      margin-left: 0;
-    }
+#settings_dialog_menu,
+#wizard_dialog_menu {
+  margin-left: 0;
+}
+
+#wizard_firstrun_acl {
+  .acl_decision {
+    margin-top: 1em;
   }
 }
+
 
 
 #settings_appearance_managelanguagesdialog_emptylist {
@@ -752,6 +736,10 @@ ul.dropdown-menu li a {
 
 .text-right {
   text-align: right;
+}
+
+.text-center {
+  text-align: center;
 }
 
 .overflow_visible {
@@ -907,6 +895,29 @@ textarea.block {
   margin-right: auto;
 }
 
+.flipH {
+  -webkit-transform: scaleX(-1);
+  -moz-transform: scaleX(-1);
+  -ms-transform: scaleX(-1);
+}
+
+.flipV {
+  -webkit-transform: scaleY(-1);
+  -moz-transform: scaleY(-1);
+  -ms-transform: scaleY(-1);
+}
+
+.flipH.flipV {
+  -webkit-transform: scaleX(-1) scaleY(-1);
+  -moz-transform: scaleX(-1) scaleY(-1);
+  -ms-transform: scaleX(-1) scaleY(-1);
+}
+
+.rotate90 {
+  -webkit-transform: rotate(-90deg);
+  transform: rotate(-90deg);
+}
+
 /** Styles for Bootstrap Slider */
 
 .slider {
@@ -970,6 +981,20 @@ textarea.block {
   @media (max-width: 979px) {
     position: static;
   }
+}
+
+// Special delivery for Safari browsers... because Safari >= 8 sometimes just
+// shows us white panes on the settings dialog when the full-sized-box has
+// an absolute position (which it needs for both scrollbars to work), at least
+// until the page is resized or otherwise a rerender is triggered, we'll have
+// our styling resolve to static positioning on that browser for now.
+//
+// This btw also means that the dialog will change in size. Yay.
+//
+// Better use something else if you have the option, that thing is really
+// weird.
+_::-webkit-full-page-media, _:future, :root .full-sized-box {
+  position: static;
 }
 
 .scrollable {

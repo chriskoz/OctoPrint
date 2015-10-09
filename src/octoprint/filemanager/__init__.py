@@ -18,6 +18,11 @@ from .analysis import QueueEntry, AnalysisQueue
 from .storage import LocalFileStorage
 from .util import AbstractFileWrapper, StreamWrapper, DiskFileWrapper
 
+from collections import namedtuple
+
+ContentTypeMapping = namedtuple("ContentTypeMapping", "extensions, content_type")
+ContentTypeDetector = namedtuple("ContentTypeDetector", "extensions, detector")
+
 extensions = dict(
 )
 
@@ -25,11 +30,11 @@ def full_extension_tree():
 	result = dict(
 		# extensions for 3d model files
 		model=dict(
-			stl=["stl"]
+			stl=ContentTypeMapping(["stl"], "application/sla")
 		),
 		# extensions for printable machine code
 		machinecode=dict(
-			gcode=["gcode", "gco", "g"]
+			gcode=ContentTypeMapping(["gcode", "gco", "g"], "text/plain")
 		)
 	)
 
@@ -68,8 +73,12 @@ def get_all_extensions(subtree=None):
 		for key, value in subtree.items():
 			if isinstance(value, dict):
 				result += get_all_extensions(value)
+			elif isinstance(value, (ContentTypeMapping, ContentTypeDetector)):
+				result += value.extensions
 			elif isinstance(value, (list, tuple)):
 				result += value
+	elif isinstance(subtree, (ContentTypeMapping, ContentTypeDetector)):
+		result = subtree.extensions
 	elif isinstance(subtree, (list, tuple)):
 		result = subtree
 	return result
@@ -79,12 +88,31 @@ def get_path_for_extension(extension, subtree=None):
 		subtree = full_extension_tree()
 
 	for key, value in subtree.items():
-		if isinstance(value, (list, tuple)) and extension in value:
+		if isinstance(value, (ContentTypeMapping, ContentTypeDetector)) and extension in value.extensions:
+			return [key]
+		elif isinstance(value, (list, tuple)) and extension in value:
 			return [key]
 		elif isinstance(value, dict):
 			path = get_path_for_extension(extension, subtree=value)
 			if path:
 				return [key] + path
+
+	return None
+
+def get_content_type_mapping_for_extension(extension, subtree=None):
+	if not subtree:
+		subtree = full_extension_tree()
+
+	for key, value in subtree.items():
+		content_extension_matches = isinstance(value, (ContentTypeMapping, ContentTypeDetector)) and extension in value. extensions
+		list_extension_matches = isinstance(value, (list, tuple)) and extension in value
+
+		if content_extension_matches or list_extension_matches:
+			return value
+		elif isinstance(value, dict):
+			result = get_content_type_mapping_for_extension(extension, subtree=value)
+			if result is not None:
+				return result
 
 	return None
 
@@ -105,6 +133,19 @@ def get_file_type(filename):
 	_, extension = os.path.splitext(filename)
 	extension = extension[1:].lower()
 	return get_path_for_extension(extension)
+
+def get_mime_type(filename):
+	_, extension = os.path.splitext(filename)
+	extension = extension[1:].lower()
+	mapping = get_content_type_mapping_for_extension(extension)
+	if mapping:
+		if isinstance(mapping, ContentTypeMapping) and mapping.content_type is not None:
+			return mapping.content_type
+		elif isinstance(mapping, ContentTypeDetector) and callable(mapping.detector):
+			result = mapping.detector(filename)
+			if result is not None:
+				return result
+	return "application/octet-stream"
 
 
 class NoSuchStorage(Exception):
@@ -136,8 +177,16 @@ class FileManager(object):
 
 	def initialize(self):
 		self.reload_plugins()
-		for storage_type, storage_manager in self._storage_managers.items():
-			self._determine_analysis_backlog(storage_type, storage_manager)
+
+		def worker():
+			self._logger.info("Adding backlog items from all storage types to analysis queue...".format(**locals()))
+			for storage_type, storage_manager in self._storage_managers.items():
+				self._determine_analysis_backlog(storage_type, storage_manager)
+
+		import threading
+		thread = threading.Thread(target=worker)
+		thread.daemon = True
+		thread.start()
 
 	def reload_plugins(self):
 		self._progress_plugins = octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.ProgressPlugin)
@@ -147,16 +196,22 @@ class FileManager(object):
 		self._slicing_progress_callbacks.append(callback)
 
 	def unregister_slicingprogress_callback(self, callback):
-		self._slicing_progress_callbacks.remove(callback)
+		try:
+			self._slicing_progress_callbacks.remove(callback)
+		except ValueError:
+			# callback was not registered
+			pass
 
 	def _determine_analysis_backlog(self, storage_type, storage_manager):
-		self._logger.info("Adding backlog items from {storage_type} to analysis queue".format(**locals()))
+		counter = 0
 		for entry, path, printer_profile in storage_manager.analysis_backlog:
 			file_type = get_file_type(path)[-1]
 
 			# we'll use the default printer profile for the backlog since we don't know better
 			queue_entry = QueueEntry(entry, file_type, storage_type, path, self._printer_profile_manager.get_default())
 			self._analysis_queue.enqueue(queue_entry, high_priority=False)
+			counter += 1
+		self._logger.info("Added {counter} items from storage type \"{storage_type}\" to analysis queue".format(**locals()))
 
 	def add_storage(self, storage_type, storage_manager):
 		self._storage_managers[storage_type] = storage_manager
@@ -304,7 +359,12 @@ class FileManager(object):
 			printer_profile = self._printer_profile_manager.get_current_or_default()
 
 		for hook in self._preprocessor_hooks.values():
-			hook_file_object = hook(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)
+			try:
+				hook_file_object = hook(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)
+			except:
+				self._logger.exception("Error when calling preprocessor hook {}, ignoring".format(hook))
+				continue
+
 			if hook_file_object is not None:
 				file_object = hook_file_object
 		file_path = self._storage(destination).add_file(path, file_object, links=links, printer_profile=printer_profile, allow_overwrite=allow_overwrite)

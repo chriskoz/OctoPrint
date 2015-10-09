@@ -103,7 +103,9 @@ def plugin_manager(init=False, plugin_folders=None, plugin_types=None, plugin_en
 				                EventHandlerPlugin,
 				                SlicerPlugin,
 				                AppPlugin,
-				                ProgressPlugin]
+				                ProgressPlugin,
+				                WizardPlugin,
+				                UiPlugin]
 			if plugin_entry_points is None:
 				plugin_entry_points = "octoprint.plugin"
 			if plugin_disabled_list is None:
@@ -151,7 +153,7 @@ def plugin_settings(plugin_key, defaults=None, get_preprocessors=None, set_prepr
 	return PluginSettings(settings(), plugin_key, defaults=defaults, get_preprocessors=get_preprocessors, set_preprocessors=set_preprocessors)
 
 
-def call_plugin(types, method, args=None, kwargs=None, callback=None, error_callback=None):
+def call_plugin(types, method, args=None, kwargs=None, callback=None, error_callback=None, sorting_context=None):
 	"""
 	Helper method to invoke the indicated ``method`` on all registered plugin implementations implementing the
 	indicated ``types``. Allows providing method arguments and registering callbacks to call in case of success
@@ -197,7 +199,7 @@ def call_plugin(types, method, args=None, kwargs=None, callback=None, error_call
 	if kwargs is None:
 		kwargs = dict()
 
-	plugins = plugin_manager().get_implementations(*types)
+	plugins = plugin_manager().get_implementations(*types, sorting_context=sorting_context)
 	for plugin in plugins:
 		if hasattr(plugin, method):
 			try:
@@ -281,6 +283,7 @@ class PluginSettings(object):
 			defaults = dict()
 		self.defaults = dict(plugins=dict())
 		self.defaults["plugins"][plugin_key] = defaults
+		self.defaults["plugins"][plugin_key]["_config_version"] = None
 
 		if get_preprocessors is None:
 			get_preprocessors = dict()
@@ -309,11 +312,17 @@ class PluginSettings(object):
 			return result
 
 		def add_getter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.get_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.get_preprocessors)
 			return kwargs
 
 		def add_setter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.set_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.set_preprocessors)
 			return kwargs
 
 		self.access_methods = dict(
@@ -418,6 +427,15 @@ class PluginSettings(object):
 			filename += "_" + postfix
 		filename += ".log"
 		return os.path.join(self.settings.getBaseFolder("logs"), filename)
+
+	@deprecated("PluginSettings.get_plugin_data_folder has been replaced by OctoPrintPlugin.get_plugin_data_folder",
+	            includedoc="Replaced by :func:`~octoprint.plugin.types.OctoPrintPlugin.get_plugin_data_folder`",
+	            since="1.2.0")
+	def get_plugin_data_folder(self):
+		path = os.path.join(self.settings.getBaseFolder("data"), self.plugin_key)
+		if not os.path.isdir(path):
+			os.makedirs(path)
+		return path
 
 	def __getattr__(self, item):
 		all_access_methods = self.access_methods.keys() + self.deprecated_access_methods.keys()

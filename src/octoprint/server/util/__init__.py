@@ -44,7 +44,7 @@ def apiKeyRequestHandler():
 		# ui api key => continue regular request processing
 		return
 
-	if not settings().get(["api", "enabled"]):
+	if not settings().getBoolean(["api", "enabled"]):
 		# api disabled => 401
 		return _flask.make_response("API disabled", 401)
 
@@ -80,6 +80,18 @@ def corsResponseHandler(resp):
 	return resp
 
 
+def noCachingResponseHandler(resp):
+	"""
+	``after_request`` handler for blueprints which shall set no caching headers
+	on their responses.
+
+	Sets ``Cache-Control``, ``Pragma`` and ``Expires`` headers accordingly
+	to prevent all client side caching from taking place.
+	"""
+
+	return flask.add_non_caching_response_headers(resp)
+
+
 def optionsAllowOrigin(request):
 	"""
 	Shortcut for request handling for CORS OPTIONS requests to set CORS headers.
@@ -104,7 +116,7 @@ def optionsAllowOrigin(request):
 
 
 def get_user_for_apikey(apikey):
-	if settings().get(["api", "enabled"]) and apikey is not None:
+	if settings().getBoolean(["api", "enabled"]) and apikey is not None:
 		if apikey == settings().get(["api", "key"]) or octoprint.server.appSessionManager.validate(apikey):
 			# master key or an app session key was used
 			return ApiUser()

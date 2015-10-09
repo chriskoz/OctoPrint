@@ -57,7 +57,7 @@ def slicingListSlicerProfiles(slicer):
 @api.route("/slicing/<string:slicer>/profiles/<string:name>", methods=["GET"])
 def slicingGetSlicerProfile(slicer, name):
 	try:
-		profile = slicingManager.load_profile(slicer, name)
+		profile = slicingManager.load_profile(slicer, name, require_configured=False)
 	except UnknownSlicer:
 		return make_response("Unknown slicer {slicer}".format(**locals()), 404)
 	except UnknownProfile:
@@ -106,7 +106,7 @@ def slicingPatchSlicerProfile(slicer, name):
 		return make_response("Expected content-type JSON", 400)
 
 	try:
-		profile = slicingManager.load_profile(slicer, name)
+		profile = slicingManager.load_profile(slicer, name, require_configured=False)
 	except UnknownSlicer:
 		return make_response("Unknown slicer {slicer}".format(**locals()), 404)
 	except UnknownProfile:
@@ -127,17 +127,16 @@ def slicingPatchSlicerProfile(slicer, name):
 	if "description" in json_data:
 		description = json_data["description"]
 
+	saved_profile = slicingManager.save_profile(slicer, name, profile,
+	                                            allow_overwrite=True,
+	                                            overrides=data,
+	                                            display_name=display_name,
+	                                            description=description)
+
 	from octoprint.server.api import valid_boolean_trues
 	if "default" in json_data and json_data["default"] in valid_boolean_trues:
-		default_profiles = s().get(["slicing", "defaultProfiles"])
-		if not default_profiles:
-			default_profiles = dict()
-		default_profiles[slicer] = name
-		s().set(["slicing", "defaultProfiles"], default_profiles)
-		s().save(force=True)
+		slicingManager.set_default_profile(slicer, name, require_exists=False)
 
-	saved_profile = slicingManager.save_profile(slicer, name, profile,
-	                                            allow_overwrite=True, overrides=data, display_name=display_name, description=description)
 	return jsonify(_getSlicingProfileData(slicer, name, saved_profile))
 
 @api.route("/slicing/<string:slicer>/profiles/<string:name>", methods=["DELETE"])

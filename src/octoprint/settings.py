@@ -30,6 +30,8 @@ import logging
 import re
 import uuid
 
+from octoprint.util import atomic_write
+
 _APPNAME = "OctoPrint"
 
 _instance = None
@@ -80,15 +82,20 @@ default_settings = {
 			"connection": 10,
 			"communication": 30,
 			"temperature": 5,
+			"temperatureTargetSet": 2,
 			"sdStatus": 1
 		},
 		"additionalPorts": [],
-		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32"]
+		"additionalBaudrates": [],
+		"longRunningCommands": ["G4", "G28", "G29", "G30", "G32", "M400", "M226"],
+		"checksumRequiringCommands": ["M110"],
+		"helloCommand": "M110 N0",
 	},
 	"server": {
 		"host": "0.0.0.0",
 		"port": 5000,
 		"firstRun": True,
+		"seenWizards": {},
 		"secretKey": None,
 		"reverseProxy": {
 			"prefixHeader": "X-Script-Name",
@@ -104,6 +111,15 @@ default_settings = {
 			"pathSuffix": "path"
 		},
 		"maxSize": 100 * 1024, # 100 KB
+		"commands": {
+			"systemShutdownCommand": None,
+			"systemRestartCommand": None,
+			"serverRestartCommand": None
+		},
+		"diskspace": {
+			"warning": 500 * 1024 * 1024, # 500 MB
+			"critical": 200 * 1024 * 1024, # 200 MB
+		}
 	},
 	"webcam": {
 		"stream": None,
@@ -134,6 +150,7 @@ default_settings = {
 		"temperatureGraph": True,
 		"waitForStartOnConnect": False,
 		"alwaysSendChecksum": False,
+		"neverSendChecksum": False,
 		"sendChecksumWithUnknownCommands": False,
 		"unknownCommandsNeedAck": False,
 		"sdSupport": True,
@@ -142,7 +159,10 @@ default_settings = {
 		"repetierTargetTemp": False,
 		"externalHeatupDetection": True,
 		"supportWait": True,
-		"keyboardControl": True
+		"keyboardControl": True,
+		"pollWatched": False,
+		"ignoreIdenticalResends": False,
+		"identicalResendsCountdown": 7
 	},
 	"folder": {
 		"uploads": None,
@@ -156,7 +176,8 @@ default_settings = {
 		"printerProfiles": None,
 		"scripts": None,
 		"translations": None,
-		"generated": None
+		"generated": None,
+		"data": None
 	},
 	"temperature": {
 		"profiles": [
@@ -186,9 +207,11 @@ default_settings = {
 				"settings": [
 					"section_printer", "serial", "printerprofiles", "temperatures", "terminalfilters", "gcodescripts",
 					"section_features", "features", "webcam", "accesscontrol", "api",
-					"section_octoprint", "folders", "appearance", "logs", "plugin_pluginmanager", "plugin_softwareupdate"
+					"section_octoprint", "server", "folders", "appearance", "logs", "plugin_pluginmanager", "plugin_softwareupdate"
 				],
 				"usersettings": ["access", "interface"],
+				"wizard": ["access"],
+				"about": ["about", "license", "thirdparty", "plugin_pluginmanager", "authors", "changelog"],
 				"generic": []
 			},
 			"disabled": {
@@ -251,7 +274,8 @@ default_settings = {
 		},
 		"webassets": {
 			"minify": False,
-			"bundle": True
+			"bundle": True,
+			"clean_on_startup": True
 		},
 		"virtualPrinter": {
 			"enabled": False,
@@ -268,6 +292,7 @@ default_settings = {
 			},
 			"hasBed": True,
 			"repetierStyleTargetTemperature": False,
+			"repetierStyleResends": False,
 			"okBeforeCommandOutput": False,
 			"smoothieTemperatureReporting": False,
 			"extendedSdFileList": False,
@@ -277,7 +302,8 @@ default_settings = {
 			"txBuffer": 40,
 			"commandBuffer": 4,
 			"sendWait": True,
-			"waitInterval": 1.0
+			"waitInterval": 1.0,
+			"supportM112": True
 		}
 	}
 }
@@ -318,14 +344,14 @@ class Settings(object):
 
 	                                               "/dev/ttyACM0"
 
-	``["serial", "timeouts"]``                 ::
+	``["serial", "timeout"]``                  ::
 
 	                                               communication: 20.0
 	                                               temperature: 5.0
 	                                               sdStatus: 1.0
 	                                               connection: 10.0
 
-	``["serial", "timeouts", "temperature"]``  ::
+	``["serial", "timeout", "temperature"]``   ::
 
 	                                               5.0
 
@@ -532,6 +558,20 @@ class Settings(object):
 	def effective_yaml(self):
 		import yaml
 		return yaml.safe_dump(self.effective)
+
+	@property
+	def effective_hash(self):
+		import hashlib
+		hash = hashlib.md5()
+		hash.update(repr(self.effective))
+		return hash.hexdigest()
+
+	@property
+	def config_hash(self):
+		import hashlib
+		hash = hashlib.md5()
+		hash.update(repr(self._config))
+		return hash.hexdigest()
 
 	#~~ load and save
 
@@ -771,11 +811,17 @@ class Settings(object):
 		if not self._dirty and not force:
 			return False
 
-		with open(self._configfile, "wb") as configFile:
-			yaml.safe_dump(self._config, configFile, default_flow_style=False, indent="    ", allow_unicode=True)
-			self._dirty = False
-		self.load()
-		return True
+		from octoprint.util import atomic_write
+		try:
+			with atomic_write(self._configfile, "wb", prefix="octoprint-config-", suffix=".yaml") as configFile:
+				yaml.safe_dump(self._config, configFile, default_flow_style=False, indent="    ", allow_unicode=True)
+				self._dirty = False
+		except:
+			self._logger.exception("Error while saving config.yaml!")
+			raise
+		else:
+			self.load()
+			return True
 
 	@property
 	def last_modified(self):
@@ -788,7 +834,7 @@ class Settings(object):
 
 	#~~ getter
 
-	def get(self, path, asdict=False, config=None, defaults=None, preprocessors=None, merged=False):
+	def get(self, path, asdict=False, config=None, defaults=None, preprocessors=None, merged=False, incl_defaults=True):
 		import octoprint.util as util
 
 		if len(path) == 0:
@@ -806,7 +852,7 @@ class Settings(object):
 			if key in config and key in defaults:
 				config = config[key]
 				defaults = defaults[key]
-			elif key in defaults:
+			elif incl_defaults and key in defaults:
 				config = {}
 				defaults = defaults[key]
 			else:
@@ -831,7 +877,7 @@ class Settings(object):
 				value = config[key]
 				if merged and key in defaults:
 					value = util.dict_merge(defaults[key], value)
-			elif key in defaults:
+			elif incl_defaults and key in defaults:
 				value = defaults[key]
 			else:
 				value = None
@@ -852,8 +898,8 @@ class Settings(object):
 		else:
 			return results
 
-	def getInt(self, path, config=None, defaults=None, preprocessors=None):
-		value = self.get(path, defaults=defaults, preprocessors=preprocessors)
+	def getInt(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
+		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
 		if value is None:
 			return None
 
@@ -863,8 +909,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getFloat(self, path, config=None, defaults=None, preprocessors=None):
-		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors)
+	def getFloat(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
+		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
 		if value is None:
 			return None
 
@@ -874,8 +920,8 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when getting option %r" % (value, path))
 			return None
 
-	def getBoolean(self, path, config=None, defaults=None, preprocessors=None):
-		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors)
+	def getBoolean(self, path, config=None, defaults=None, preprocessors=None, incl_defaults=True):
+		value = self.get(path, config=config, defaults=defaults, preprocessors=preprocessors, incl_defaults=incl_defaults)
 		if value is None:
 			return None
 		if isinstance(value, bool):
@@ -930,14 +976,15 @@ class Settings(object):
 
 	#~~ setter
 
-	def set(self, path, value, force=False, defaults=None, preprocessors=None):
+	def set(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
 		if len(path) == 0:
 			return
 
 		if self._mtime is not None and self.last_modified != self._mtime:
 			self.load()
 
-		config = self._config
+		if config is None:
+			config = self._config
 		if defaults is None:
 			defaults = default_settings
 		if preprocessors is None:
@@ -966,16 +1013,16 @@ class Settings(object):
 		if not force and key in defaults and key in config and defaults[key] == value:
 			del config[key]
 			self._dirty = True
-		elif force or (not key in config and defaults[key] != value) or (key in config and config[key] != value):
-			if value is None:
+		elif force or (not key in config and key in defaults and defaults[key] != value) or (key in config and config[key] != value):
+			if value is None and key in config:
 				del config[key]
 			else:
 				config[key] = value
 			self._dirty = True
 
-	def setInt(self, path, value, force=False, defaults=None, preprocessors=None):
+	def setInt(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
 		if value is None:
-			self.set(path, None, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, None, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 			return
 
 		try:
@@ -984,11 +1031,11 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when setting option %r" % (value, path))
 			return
 
-		self.set(path, intValue, force)
+		self.set(path, intValue, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 
-	def setFloat(self, path, value, force=False, defaults=None, preprocessors=None):
+	def setFloat(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
 		if value is None:
-			self.set(path, None, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, None, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 			return
 
 		try:
@@ -997,15 +1044,15 @@ class Settings(object):
 			self._logger.warn("Could not convert %r to a valid integer when setting option %r" % (value, path))
 			return
 
-		self.set(path, floatValue, force)
+		self.set(path, floatValue, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 
-	def setBoolean(self, path, value, force=False, defaults=None, preprocessors=None):
+	def setBoolean(self, path, value, force=False, defaults=None, config=None, preprocessors=None):
 		if value is None or isinstance(value, bool):
-			self.set(path, value, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, value, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 		elif value.lower() in valid_boolean_trues:
-			self.set(path, True, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, True, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 		else:
-			self.set(path, False, force=force, defaults=defaults, preprocessors=preprocessors)
+			self.set(path, False, config=config, force=force, defaults=defaults, preprocessors=preprocessors)
 
 	def setBaseFolder(self, type, path, force=False):
 		if type not in default_settings["folder"].keys():
@@ -1027,14 +1074,14 @@ class Settings(object):
 	def saveScript(self, script_type, name, script):
 		script_folder = self.getBaseFolder("scripts")
 		filename = os.path.realpath(os.path.join(script_folder, script_type, name))
-		if not filename.startswith(script_folder):
+		if not filename.startswith(os.path.realpath(script_folder)):
 			# oops, jail break, that shouldn't happen
 			raise ValueError("Invalid script path to save to: {filename} (from {script_type}:{name})".format(**locals()))
 
 		path, _ = os.path.split(filename)
 		if not os.path.exists(path):
 			os.makedirs(path)
-		with open(filename, "w+") as f:
+		with atomic_write(filename, "wb") as f:
 			f.write(script)
 
 def _default_basedir(applicationName):
