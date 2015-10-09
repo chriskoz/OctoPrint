@@ -69,9 +69,32 @@ class OctoPrintPlugin(Plugin):
 
 	   The :class:`~octoprint.server.LifecycleManager` instance. Injected by the plugin core system upon initialization
 	   of the implementation.
+
+	.. attribute:: _data_folder
+
+	   Path to the data folder for the plugin to use for any data it might have to persist. Should always be accessed
+	   through :meth:`get_plugin_data_folder` since that function will also ensure that the data folder actually exists
+	   and if not creating it before returning it. Injected by the plugin core system upon initialization of the
+	   implementation.
+
+    .. automethod:: get_plugin_data_folder
 	"""
 
-	pass
+	def get_plugin_data_folder(self):
+		"""
+		Retrieves the path to a data folder specifically for the plugin, ensuring it exists and if not creating it
+		before returning it.
+
+		Plugins may use this folder for storing additional data they need for their operation.
+		"""
+		if self._data_folder is None:
+			raise RuntimeError("self._plugin_data_folder is None, has the plugin been initialized yet?")
+
+		import os
+		if not os.path.isdir(self._data_folder):
+			os.makedirs(self._data_folder)
+		return self._data_folder
+
 
 class ReloadNeedingPlugin(Plugin):
 	pass
@@ -718,7 +741,7 @@ class SettingsPlugin(OctoPrintPlugin):
 	       def on_settings_save(self, data):
 	           old_flag = self._settings.get_boolean(["sub", "some_flag"])
 
-	           super(MySettingsPlugin, self).on_settings_save(data)
+	           octoprint.plugin.SettingsPlugin.on_settings_save(self, data)
 
 	           new_flag = self._settings.get_boolean(["sub", "some_flag"])
 	           if old_flag != new_flag:
@@ -758,7 +781,10 @@ class SettingsPlugin(OctoPrintPlugin):
 
 		:return: the current settings of the plugin, as a dictionary
 		"""
-		return self._settings.get([], asdict=True, merged=True)
+		data = self._settings.get([], asdict=True, merged=True)
+		if "_config_version" in data:
+			del data["_config_version"]
+		return data
 
 	def on_settings_save(self, data):
 		"""
@@ -780,9 +806,12 @@ class SettingsPlugin(OctoPrintPlugin):
 		"""
 		import octoprint.util
 
+		if "_config_version" in data:
+			del data["_config_version"]
+
 		current = self._settings.get([], asdict=True, merged=True)
-		data = octoprint.util.dict_merge(current, data)
-		self._settings.set([], data)
+		merged = octoprint.util.dict_merge(current, data)
+		self._settings.set([], merged)
 
 	def get_settings_defaults(self):
 		"""
@@ -829,6 +858,50 @@ class SettingsPlugin(OctoPrintPlugin):
 		        getters, the second the preprocessors for setters
 		"""
 		return dict(), dict()
+
+	def get_settings_version(self):
+		"""
+		Retrieves the settings format version of the plugin.
+
+		Use this to have OctoPrint trigger your migration function if it detects an outdated settings version in
+		config.yaml.
+
+		Returns:
+		    int or None: an int signifying the current settings format, should be incremented by plugins whenever there
+		                 are backwards incompatible changes. Returning None here disables the version tracking for the
+		                 plugin's configuration.
+		"""
+		return None
+
+	def on_settings_migrate(self, target, current):
+		"""
+		Called by OctoPrint if it detects that the installed version of the plugin necessitates a higher settings version
+		than the one currently stored in _config.yaml. Will also be called if the settings data stored in config.yaml
+		doesn't have version information, in which case the ``current`` parameter will be None.
+
+		Your plugin's implementation should take care of migrating any data by utilizing self._settings. OctoPrint
+		will take care of saving any changes to disk by calling `self._settings.save()` after returning from this method.
+
+		This method will be called before your plugin's :func:`on_settings_initialized` method, with all injections already
+		having taken place. You can therefore depend on the configuration having been migrated by the time
+		:func:`on_settings_initialized` is called.
+
+		Arguments:
+		    target (int): The settings format version the plugin requires, this should always be the same value as
+		                  returned by :func:`get_settings_version`.
+		    current (int or None): The settings format version as currently stored in config.yaml. May be None if
+		                  no version information can be found.
+		"""
+		pass
+
+	def on_settings_initialized(self):
+		"""
+		Called after the settings have been initialized and - if necessary - also been migrated through a call to
+		func:`on_settings_migrate`.
+
+		This method will always be called after the `initialize` method.
+		"""
+		pass
 
 
 class EventHandlerPlugin(OctoPrintPlugin):

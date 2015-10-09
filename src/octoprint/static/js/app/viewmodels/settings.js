@@ -6,6 +6,10 @@ $(function() {
         self.users = parameters[1];
         self.printerProfiles = parameters[2];
 
+        self.receiving = ko.observable(false);
+        self.sending = ko.observable(false);
+        self.callbacks = [];
+
         self.api_enabled = ko.observable(undefined);
         self.api_key = ko.observable(undefined);
         self.api_allowCrossOrigin = ko.observable(undefined);
@@ -113,6 +117,8 @@ $(function() {
         self.feature_repetierTargetTemp = ko.observable(undefined);
         self.feature_disableExternalHeatupDetection = ko.observable(undefined);
         self.feature_keyboardControl = ko.observable(undefined);
+        self.feature_pollWatched = ko.observable(undefined);
+        self.feature_ignoreIdenticalResends = ko.observable(undefined);
 
         self.serial_port = ko.observable();
         self.serial_baudrate = ko.observable();
@@ -147,6 +153,15 @@ $(function() {
         self.system_actions = ko.observableArray([]);
 
         self.terminalFilters = ko.observableArray([]);
+
+        self.server_commands_systemShutdownCommand = ko.observable(undefined);
+        self.server_commands_systemRestartCommand = ko.observable(undefined);
+        self.server_commands_serverRestartCommand = ko.observable(undefined);
+
+        self.server_diskspace_warning = ko.observable();
+        self.server_diskspace_critical = ko.observable();
+        self.server_diskspace_warning_str = sizeObservable(self.server_diskspace_warning);
+        self.server_diskspace_critical_str = sizeObservable(self.server_diskspace_critical);
 
         self.settings = undefined;
 
@@ -256,13 +271,42 @@ $(function() {
         };
 
         self.requestData = function(callback) {
+            if (self.receiving()) {
+                if (callback) {
+                    self.callbacks.push(callback);
+                }
+                return;
+            }
+
+            self.receiving(true);
             $.ajax({
                 url: API_BASEURL + "settings",
                 type: "GET",
                 dataType: "json",
                 success: function(response) {
-                    self.fromResponse(response);
-                    if (callback) callback();
+                    if (callback) {
+                        self.callbacks.push(callback);
+                    }
+
+                    try {
+                        self.fromResponse(response);
+
+                        var cb;
+                        while (self.callbacks.length) {
+                            cb = self.callbacks.shift();
+                            try {
+                                cb();
+                            } catch(exc) {
+                                log.error("Error calling settings callback", cb, ":", (exc.stack || exc));
+                            }
+                        }
+                    } finally {
+                        self.receiving(false);
+                        self.callbacks = [];
+                    }
+                },
+                error: function(xhr) {
+                    self.receiving(false);
                 }
             });
         };
@@ -377,6 +421,7 @@ $(function() {
             self.feature_repetierTargetTemp(response.feature.repetierTargetTemp);
             self.feature_disableExternalHeatupDetection(!response.feature.externalHeatupDetection);
             self.feature_keyboardControl(response.feature.keyboardControl);
+            self.feature_pollWatched(response.feature.pollWatched);
 
             self.serial_port(response.serial.port);
             self.serial_baudrate(response.serial.baudrate);
@@ -413,12 +458,18 @@ $(function() {
             self.system_actions(response.system.actions);
 
             self.terminalFilters(response.terminalFilters);
+
+            self.server_commands_systemShutdownCommand(response.server.commands.systemShutdownCommand);
+            self.server_commands_systemRestartCommand(response.server.commands.systemRestartCommand);
+            self.server_commands_serverRestartCommand(response.server.commands.serverRestartCommand);
         };
 
         self.saveData = function (data, successCallback) {
             self.settingsDialog.trigger("beforeSave");
 
             if (data == undefined) {
+                // we only set sending to true when we didn't include data
+                self.sending(true);
                 data = ko.mapping.toJS(self.settings);
 
                 data = _.extend(data, {
@@ -457,7 +508,8 @@ $(function() {
                         "swallowOkAfterResend": self.feature_swallowOkAfterResend(),
                         "repetierTargetTemp": self.feature_repetierTargetTemp(),
                         "externalHeatupDetection": !self.feature_disableExternalHeatupDetection(),
-                        "keyboardControl": self.feature_keyboardControl()
+                        "keyboardControl": self.feature_keyboardControl(),
+                        "pollWatched": self.feature_pollWatched()
                     },
                     "serial": {
                         "port": self.serial_port(),
@@ -496,6 +548,13 @@ $(function() {
                             "beforePrintResumed": self.scripts_gcode_beforePrintResumed(),
                             "afterPrinterConnected": self.scripts_gcode_afterPrinterConnected()
                         }
+                    },
+                    "server": {
+                        "commands": {
+                            "systemShutdownCommand": self.server_commands_systemShutdownCommand(),
+                            "systemRestartCommand": self.server_commands_systemRestartCommand(),
+                            "serverRestartCommand": self.server_commands_serverRestartCommand()
+                        }
                     }
                 });
             }
@@ -507,10 +566,23 @@ $(function() {
                 contentType: "application/json; charset=UTF-8",
                 data: JSON.stringify(data),
                 success: function(response) {
-                    self.fromResponse(response);
-                    if (successCallback) successCallback(response);
+                    self.receiving(true);
+                    self.sending(false);
+                    try {
+                        self.fromResponse(response);
+                        if (successCallback) successCallback(response);
+                    } finally {
+                        self.receiving(false);
+                    }
+                },
+                error: function(xhr) {
+                    self.sending(false);
                 }
             });
+        };
+
+        self.onEventSettingsUpdated = function() {
+            self.requestData();
         };
     }
 

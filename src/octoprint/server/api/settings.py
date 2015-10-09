@@ -26,6 +26,8 @@ import octoprint.util
 
 @api.route("/settings", methods=["GET"])
 def getSettings():
+	logger = logging.getLogger(__name__)
+
 	s = settings()
 
 	connectionOptions = get_connection_options()
@@ -66,7 +68,9 @@ def getSettings():
 			"swallowOkAfterResend": s.getBoolean(["feature", "swallowOkAfterResend"]),
 			"repetierTargetTemp": s.getBoolean(["feature", "repetierTargetTemp"]),
 			"externalHeatupDetection": s.getBoolean(["feature", "externalHeatupDetection"]),
-			"keyboardControl": s.getBoolean(["feature", "keyboardControl"])
+			"keyboardControl": s.getBoolean(["feature", "keyboardControl"]),
+			"pollWatched": s.getBoolean(["feature", "pollWatched"]),
+			"ignoreIdenticalResends": s.getBoolean(["feature", "ignoreIdenticalResends"])
 		},
 		"serial": {
 			"port": connectionOptions["portPreference"],
@@ -109,6 +113,17 @@ def getSettings():
 				"afterPrintResumed": None,
 				"snippets": dict()
 			}
+		},
+		"server": {
+			"commands": {
+				"systemShutdownCommand": s.get(["server", "commands", "systemShutdownCommand"]),
+				"systemRestartCommand": s.get(["server", "commands", "systemRestartCommand"]),
+				"serverRestartCommand": s.get(["server", "commands", "serverRestartCommand"])
+			},
+			"diskspace": {
+				"warning": s.getInt(["server", "diskspace", "warning"]),
+				"critical": s.getInt(["server", "diskspace", "critical"])
+			}
 		}
 	}
 
@@ -118,17 +133,30 @@ def getSettings():
 		for name in gcode_scripts:
 			data["scripts"]["gcode"][name] = s.loadScript("gcode", name, source=True)
 
-	def process_plugin_result(name, plugin, result):
+	def process_plugin_result(name, result):
 		if result:
+			try:
+				jsonify(test=result)
+			except:
+				logger.exception("Error while jsonifying settings from plugin {}, please contact the plugin author about this".format(name))
+
 			if not "plugins" in data:
 				data["plugins"] = dict()
 			if "__enabled" in result:
 				del result["__enabled"]
 			data["plugins"][name] = result
 
-	octoprint.plugin.call_plugin(octoprint.plugin.SettingsPlugin,
-	                             "on_settings_load",
-	                             callback=process_plugin_result)
+	for plugin in octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.SettingsPlugin):
+		try:
+			result = plugin.on_settings_load()
+			process_plugin_result(plugin._identifier, result)
+		except TypeError:
+			logger.warn("Could not load settings for plugin {name} ({version}) since it called super(...)".format(name=plugin._plugin_name, version=plugin._plugin_version))
+			logger.warn("in a way which has issues due to OctoPrint's dynamic reloading after plugin operations.")
+			logger.warn("Please contact the plugin's author and ask to update the plugin to use a direct call like")
+			logger.warn("octoprint.plugin.SettingsPlugin.on_settings_load(self) instead.")
+		except:
+			logger.exception("Could not load settings for plugin {name} ({version})".format(version=plugin._plugin_version, name=plugin._plugin_name))
 
 	return jsonify(data)
 
@@ -137,6 +165,8 @@ def getSettings():
 @restricted_access
 @admin_permission.require(403)
 def setSettings():
+	logger = logging.getLogger(__name__)
+
 	if not "application/json" in request.headers["Content-Type"]:
 		return make_response("Expected content-type JSON", 400)
 
@@ -182,6 +212,8 @@ def setSettings():
 		if "repetierTargetTemp" in data["feature"].keys(): s.setBoolean(["feature", "repetierTargetTemp"], data["feature"]["repetierTargetTemp"])
 		if "externalHeatupDetection" in data["feature"].keys(): s.setBoolean(["feature", "externalHeatupDetection"], data["feature"]["externalHeatupDetection"])
 		if "keyboardControl" in data["feature"].keys(): s.setBoolean(["feature", "keyboardControl"], data["feature"]["keyboardControl"])
+		if "pollWatched" in data["feature"]: s.setBoolean(["feature", "pollWatched"], data["feature"]["pollWatched"])
+		if "ignoreIdenticalResends" in data["feature"]: s.setBoolean(["feature", "ignoreIdenticalResends"], data["feature"]["ignoreIdenticalResends"])
 
 	if "serial" in data.keys():
 		if "autoconnect" in data["serial"].keys(): s.setBoolean(["serial", "autoconnect"], data["serial"]["autoconnect"])
@@ -231,12 +263,28 @@ def setSettings():
 					continue
 				s.saveScript("gcode", name, script.replace("\r\n", "\n").replace("\r", "\n"))
 
+	if "server" in data:
+		if "commands" in data["server"]:
+			if "systemShutdownCommand" in data["server"]["commands"].keys(): s.set(["server", "commands", "systemShutdownCommand"], data["server"]["commands"]["systemShutdownCommand"])
+			if "systemRestartCommand" in data["server"]["commands"].keys(): s.set(["server", "commands", "systemRestartCommand"], data["server"]["commands"]["systemRestartCommand"])
+			if "serverRestartCommand" in data["server"]["commands"].keys(): s.set(["server", "commands", "serverRestartCommand"], data["server"]["commands"]["serverRestartCommand"])
+		if "diskspace" in data["server"]:
+			if "warning" in data["server"]["diskspace"]: s.setInt(["server", "diskspace", "warning"], data["server"]["diskspace"]["warning"])
+			if "critical" in data["server"]["diskspace"]: s.setInt(["server", "diskspace", "critical"], data["server"]["diskspace"]["critical"])
+
 	if "plugins" in data:
 		for plugin in octoprint.plugin.plugin_manager().get_implementations(octoprint.plugin.SettingsPlugin):
 			plugin_id = plugin._identifier
 			if plugin_id in data["plugins"]:
-				plugin.on_settings_save(data["plugins"][plugin_id])
-
+				try:
+					plugin.on_settings_save(data["plugins"][plugin_id])
+				except TypeError:
+					logger.warn("Could not save settings for plugin {name} ({version}) since it called super(...)".format(name=plugin._plugin_name, version=plugin._plugin_version))
+					logger.warn("in a way which has issues due to OctoPrint's dynamic reloading after plugin operations.")
+					logger.warn("Please contact the plugin's author and ask to update the plugin to use a direct call like")
+					logger.warn("octoprint.plugin.SettingsPlugin.on_settings_save(self, data) instead.")
+				except:
+					logger.exception("Could not save settings for plugin {name} ({version})".format(version=plugin._plugin_version, name=plugin._plugin_name))
 
 	if s.save():
 		eventManager().fire(Events.SETTINGS_UPDATED)

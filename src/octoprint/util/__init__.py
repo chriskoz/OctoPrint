@@ -17,7 +17,7 @@ import shutil
 import threading
 from functools import wraps
 import warnings
-
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -197,29 +197,12 @@ def get_exception_string():
 	return "%s: '%s' @ %s:%s:%d" % (str(sys.exc_info()[0].__name__), str(sys.exc_info()[1]), os.path.basename(locationInfo[0]), locationInfo[2], locationInfo[1])
 
 
+@deprecated("get_free_bytes has been deprecated and will be removed in the future",
+            includedoc="Replaced by `psutil.disk_usage <http://pythonhosted.org/psutil/#psutil.disk_usage>`_.",
+            since="1.2.5")
 def get_free_bytes(path):
-	"""
-	Retrieves the number of free bytes on the partition ``path`` is located at and returns it. Works on both Windows and
-	Unix/Linux.
-
-	Taken from http://stackoverflow.com/a/2372171/2028598
-
-	Arguments:
-	    path (string): The path for which to check the remaining partition space.
-
-	Returns:
-	    int: The amount of bytes still left on the partition.
-	"""
-
-	path = os.path.abspath(path)
-	if sys.platform == "win32":
-		import ctypes
-		freeBytes = ctypes.c_ulonglong(0)
-		ctypes.windll.kernel32.GetDiskFreeSpaceExW(ctypes.c_wchar_p(path), None, None, ctypes.pointer(freeBytes))
-		return freeBytes.value
-	else:
-		st = os.statvfs(path)
-		return st.f_bavail * st.f_frsize
+	import psutil
+	return psutil.disk_usage(path).free
 
 
 def get_dos_filename(origin, existing_filenames=None, extension=None, **kwargs):
@@ -352,9 +335,7 @@ def silent_remove(file):
 def sanitize_ascii(line):
 	if not isinstance(line, basestring):
 		raise ValueError("Expected either str or unicode but got {} instead".format(line.__class__.__name__ if line is not None else None))
-	if isinstance(line, str):
-		line = unicode(line, 'ascii', 'replace')
-	return line.encode('ascii', 'replace').rstrip()
+	return to_unicode(line, encoding="ascii", errors="replace").rstrip()
 
 
 def filter_non_ascii(line):
@@ -369,10 +350,26 @@ def filter_non_ascii(line):
 	"""
 
 	try:
-		unicode(line, 'ascii').encode('ascii')
+		to_str(to_unicode(line, encoding="ascii"), encoding="ascii")
 		return False
 	except ValueError:
 		return True
+
+
+def to_str(s_or_u, encoding="utf-8", errors="strict"):
+	"""Make sure ``s_or_u`` is a str."""
+	if isinstance(s_or_u, unicode):
+		return s_or_u.encode(encoding, errors=errors)
+	else:
+		return s_or_u
+
+
+def to_unicode(s_or_u, encoding="utf-8", errors="strict"):
+	"""Make sure ``s_or_u`` is a unicode string."""
+	if isinstance(s_or_u, str):
+		return s_or_u.decode(encoding, errors=errors)
+	else:
+		return s_or_u
 
 
 def dict_merge(a, b):
@@ -499,6 +496,15 @@ def address_for_client(host, port):
 		except:
 			continue
 
+
+@contextlib.contextmanager
+def atomic_write(filename, mode="w+b", prefix="tmp", suffix=""):
+	temp_config = tempfile.NamedTemporaryFile(mode=mode, prefix=prefix, suffix=suffix, delete=False)
+	yield temp_config
+	temp_config.close()
+	shutil.move(temp_config.name, filename)
+
+
 class RepeatedTimer(threading.Thread):
 	"""
 	This class represents an action that should be run repeatedly in an interval. It is similar to python's
@@ -556,9 +562,10 @@ class RepeatedTimer(threading.Thread):
 	    run_first (boolean): If set to True, the function will be run for the first time *before* the first wait period.
 	        If set to False (the default), the function will be run for the first time *after* the first wait period.
 	    condition (callable): Condition that needs to be True for loop to continue. Defaults to ``lambda: True``.
+	    daemon (bool): daemon flag to set on underlying thread.
 	"""
 
-	def __init__(self, interval, function, args=None, kwargs=None, run_first=False, condition=None):
+	def __init__(self, interval, function, args=None, kwargs=None, run_first=False, condition=None, daemon=True):
 		threading.Thread.__init__(self)
 
 		if args is None:
@@ -579,6 +586,7 @@ class RepeatedTimer(threading.Thread):
 		self.kwargs = kwargs
 		self.run_first = run_first
 		self.condition = condition
+		self.daemon = daemon
 
 	def cancel(self):
 		self.finished.set()

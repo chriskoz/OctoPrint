@@ -31,6 +31,79 @@ try:
 except:
 	pass
 
+_logger = logging.getLogger(__name__)
+
+# a bunch of regexes we'll need for the communication parsing...
+
+regex_float_pattern = "[-+]?[0-9]*\.?[0-9]+"
+regex_positive_float_pattern = "[+]?[0-9]*\.?[0-9]+"
+regex_int_pattern = "\d+"
+
+regex_command = re.compile("^\s*((?P<commandGM>[GM]\d+)|(?P<commandT>T)\d+)")
+"""Regex for a GCODE command."""
+
+regex_float = re.compile(regex_float_pattern)
+"""Regex for a float value."""
+
+regexes_parameters = dict(
+	floatP=re.compile("(^|[^A-Za-z])[Pp](?P<value>%s)" % regex_float_pattern),
+	floatS=re.compile("(^|[^A-Za-z])[Ss](?P<value>%s)" % regex_float_pattern),
+	floatZ=re.compile("(^|[^A-Za-z])[Zz](?P<value>%s)" % regex_float_pattern),
+	intN=re.compile("(^|[^A-Za-z])[Nn](?P<value>%s)" % regex_int_pattern),
+	intT=re.compile("(^|[^A-Za-z])[Tt](?P<value>%s)" % regex_int_pattern)
+)
+"""Regexes for parsing various GCODE command parameters."""
+
+regex_minMaxError = re.compile("Error:[0-9]\n")
+"""Regex matching first line of min/max errors from the firmware."""
+
+regex_sdPrintingByte = re.compile("(?P<current>[0-9]*)/(?P<total>[0-9]*)")
+"""Regex matching SD printing status reports.
+
+Groups will be as follows:
+
+  * ``current``: current byte position in file being printed
+  * ``total``: total size of file being printed
+"""
+
+regex_sdFileOpened = re.compile("File opened:\s*(?P<name>.*?)\s+Size:\s*(?P<size>%s)" % regex_int_pattern)
+"""Regex matching "File opened" messages from the firmware.
+
+Groups will be as follows:
+
+  * ``name``: name of the file reported as having been opened (str)
+  * ``size``: size of the file in bytes (int)
+"""
+
+regex_temp = re.compile("(?P<tool>B|T(?P<toolnum>\d*)):\s*(?P<actual>%s)(\s*\/?\s*(?P<target>%s))?" % (regex_positive_float_pattern, regex_positive_float_pattern))
+"""Regex matching temperature entries in line.
+
+Groups will be as follows:
+
+  * ``tool``: whole tool designator, incl. optional ``toolnum`` (str)
+  * ``toolnum``: tool number, if provided (int)
+  * ``actual``: actual temperature (float)
+  * ``target``: target temperature, if provided (float)
+"""
+
+regex_repetierTempExtr = re.compile("TargetExtr(?P<toolnum>\d+):(?P<target>%s)" % regex_positive_float_pattern)
+"""Regex for matching target temp reporting from Repetier.
+
+Groups will be as follows:
+
+  * ``toolnum``: number of the extruder to which the target temperature
+    report belongs (int)
+  * ``target``: new target temperature (float)
+"""
+
+regex_repetierTempBed = re.compile("TargetBed:(?P<target>%s)" % regex_positive_float_pattern)
+"""Regex for matching target temp reporting from Repetier for beds.
+
+Groups will be as follows:
+
+  * ``target``: new target temperature (float)
+"""
+
 def serialList():
 	baselist=[]
 	if os.name=="nt":
@@ -151,6 +224,7 @@ class MachineCom(object):
 
 		self._long_running_command = False
 		self._heating = False
+		self._connection_closing = False
 
 		self._timeout = None
 
@@ -158,12 +232,15 @@ class MachineCom(object):
 		self._sendChecksumWithUnknownCommands = settings().getBoolean(["feature", "sendChecksumWithUnknownCommands"])
 		self._unknownCommandsNeedAck = settings().getBoolean(["feature", "unknownCommandsNeedAck"])
 		self._currentLine = 1
+		self._line_mutex = threading.RLock()
 		self._resendDelta = None
 		self._lastLines = deque([], 50)
 		self._lastCommError = None
 		self._lastResendNumber = None
 		self._currentResendCount = 0
 		self._resendSwallowNextOk = False
+		self._resendSwallowRepetitions = settings().getBoolean(["feature", "ignoreIdenticalResends"])
+		self._resendSwallowRepetitionsCounter = 0
 
 		self._clear_to_send = CountedEvent(max=10, name="comm.clear_to_send")
 		self._send_queue = TypedQueue()
@@ -195,28 +272,6 @@ class MachineCom(object):
 		self._currentFile = None
 
 		# regexes
-		floatPattern = "[-+]?[0-9]*\.?[0-9]+"
-		positiveFloatPattern = "[+]?[0-9]*\.?[0-9]+"
-		intPattern = "\d+"
-		self._regex_command = re.compile("^\s*([GM]\d+|T)")
-		self._regex_float = re.compile(floatPattern)
-		self._regex_paramZFloat = re.compile("Z(%s)" % floatPattern)
-		self._regex_paramSInt = re.compile("S(%s)" % intPattern)
-		self._regex_paramNInt = re.compile("N(%s)" % intPattern)
-		self._regex_paramTInt = re.compile("T(%s)" % intPattern)
-		self._regex_minMaxError = re.compile("Error:[0-9]\n")
-		self._regex_sdPrintingByte = re.compile("([0-9]*)/([0-9]*)")
-		self._regex_sdFileOpened = re.compile("File opened:\s*(.*?)\s+Size:\s*(%s)" % intPattern)
-
-		# Regex matching temperature entries in line. Groups will be as follows:
-		# - 1: whole tool designator incl. optional toolNumber ("T", "Tn", "B")
-		# - 2: toolNumber, if given ("", "n", "")
-		# - 3: actual temperature
-		# - 4: whole target substring, if given (e.g. " / 22.0")
-		# - 5: target temperature
-		self._regex_temp = re.compile("(B|T(\d*)):\s*(%s)(\s*\/?\s*(%s))?" % (positiveFloatPattern, positiveFloatPattern))
-		self._regex_repetierTempExtr = re.compile("TargetExtr([0-9]+):(%s)" % positiveFloatPattern)
-		self._regex_repetierTempBed = re.compile("TargetBed:(%s)" % positiveFloatPattern)
 
 		self._long_running_commands = settings().get(["serial", "longRunningCommands"])
 
@@ -383,6 +438,10 @@ class MachineCom(object):
 	##~~ external interface
 
 	def close(self, isError = False):
+		if self._connection_closing:
+			return
+		self._connection_closing = True
+
 		if self._temperature_timer is not None:
 			try:
 				self._temperature_timer.cancel()
@@ -400,11 +459,15 @@ class MachineCom(object):
 
 		printing = self.isPrinting() or self.isPaused()
 		if self._serial is not None:
+			try:
+				self._serial.close()
+			except:
+				self._logger.exception("Error while trying to close serial port")
+				isError = True
 			if isError:
 				self._changeState(self.STATE_CLOSED_WITH_ERROR)
 			else:
 				self._changeState(self.STATE_CLOSED)
-			self._serial.close()
 		self._serial = None
 
 		if settings().get(["feature", "sdSupport"]):
@@ -529,7 +592,7 @@ class MachineCom(object):
 
 				self.sendCommand("M24")
 
-				self._sd_status_timer = RepeatedTimer(lambda: get_interval("sdStatus"), self._poll_sd_status, run_first=True)
+				self._sd_status_timer = RepeatedTimer(lambda: get_interval("sdStatus", default_value=1.0), self._poll_sd_status, run_first=True)
 				self._sd_status_timer.start()
 			else:
 				line = self._getNext()
@@ -708,51 +771,9 @@ class MachineCom(object):
 
 	##~~ communication monitoring and handling
 
-	def _parseTemperatures(self, line):
-		result = {}
-		maxToolNum = 0
-		for match in re.finditer(self._regex_temp, line):
-			tool = match.group(1)
-			toolNumber = int(match.group(2)) if match.group(2) and len(match.group(2)) > 0 else None
-			if toolNumber > maxToolNum:
-				maxToolNum = toolNumber
-
-			try:
-				actual = float(match.group(3))
-				target = None
-				if match.group(4) and match.group(5):
-					target = float(match.group(5))
-
-				result[tool] = (toolNumber, actual, target)
-			except ValueError:
-				# catch conversion issues, we'll rather just not get the temperature update instead of killing the connection
-				pass
-
-		if "T0" in result.keys() and "T" in result.keys():
-			del result["T"]
-
-		return maxToolNum, result
-
 	def _processTemperatures(self, line):
-		maxToolNum, parsedTemps = self._parseTemperatures(line)
-
-		# extruder temperatures
-		if not "T0" in parsedTemps.keys() and not "T1" in parsedTemps.keys() and "T" in parsedTemps.keys():
-			# no T1 so only single reporting, "T" is our one and only extruder temperature
-			toolNum, actual, target = parsedTemps["T"]
-
-			if target is not None:
-				self._temp[0] = (actual, target)
-			elif 0 in self._temp.keys() and self._temp[0] is not None and isinstance(self._temp[0], tuple):
-				(oldActual, oldTarget) = self._temp[0]
-				self._temp[0] = (actual, oldTarget)
-			else:
-				self._temp[0] = (actual, None)
-		elif not "T0" in parsedTemps.keys() and "T" in parsedTemps.keys():
-			# Smoothieware sends multi extruder temperature data this way: "T:<first extruder> T1:<second extruder> ..." and therefore needs some special treatment...
-			_, actual, target = parsedTemps["T"]
-			del parsedTemps["T"]
-			parsedTemps["T0"] = (0, actual, target)
+		current_tool = self._currentTool if self._currentTool is not None else 0
+		maxToolNum, parsedTemps = parse_temperature_line(line, current_tool)
 
 		if "T0" in parsedTemps.keys():
 			for n in range(maxToolNum + 1):
@@ -760,18 +781,18 @@ class MachineCom(object):
 				if not tool in parsedTemps.keys():
 					continue
 
-				toolNum, actual, target = parsedTemps[tool]
+				actual, target = parsedTemps[tool]
 				if target is not None:
-					self._temp[toolNum] = (actual, target)
-				elif toolNum in self._temp.keys() and self._temp[toolNum] is not None and isinstance(self._temp[toolNum], tuple):
-					(oldActual, oldTarget) = self._temp[toolNum]
-					self._temp[toolNum] = (actual, oldTarget)
+					self._temp[n] = (actual, target)
+				elif n in self._temp and self._temp[n] is not None and isinstance(self._temp[n], tuple):
+					(oldActual, oldTarget) = self._temp[n]
+					self._temp[n] = (actual, oldTarget)
 				else:
-					self._temp[toolNum] = (actual, None)
+					self._temp[n] = (actual, None)
 
 		# bed temperature
 		if "B" in parsedTemps.keys():
-			toolNum, actual, target = parsedTemps["B"]
+			actual, target = parsedTemps["B"]
 			if target is not None:
 				self._bedTemp = (actual, target)
 			elif self._bedTemp is not None and isinstance(self._bedTemp, tuple):
@@ -844,7 +865,11 @@ class MachineCom(object):
 							self._callback.on_comm_force_disconnect()
 						else:
 							for hook in self._printer_action_hooks:
-								self._printer_action_hooks[hook](self, line, action_command)
+								try:
+									self._printer_action_hooks[hook](self, line, action_command)
+								except:
+									self._logger.exception("Error while calling hook {} with action command {}".format(self._printer_action_hooks[hook], action_command))
+									continue
 					else:
 						continue
 
@@ -895,8 +920,8 @@ class MachineCom(object):
 					self._callback.on_comm_temperature_update(self._temp, self._bedTemp)
 
 				elif supportRepetierTargetTemp and ('TargetExtr' in line or 'TargetBed' in line):
-					matchExtr = self._regex_repetierTempExtr.match(line)
-					matchBed = self._regex_repetierTempBed.match(line)
+					matchExtr = regex_repetierTempExtr.match(line)
+					matchBed = regex_repetierTempBed.match(line)
 
 					if matchExtr is not None:
 						toolNum = int(matchExtr.group(1))
@@ -950,18 +975,18 @@ class MachineCom(object):
 					self._callback.on_comm_sd_files(self._sdFiles)
 				elif 'SD printing byte' in line and self.isSdPrinting():
 					# answer to M27, at least on Marlin, Repetier and Sprinter: "SD printing byte %d/%d"
-					match = self._regex_sdPrintingByte.search(line)
-					self._currentFile.setFilepos(int(match.group(1)))
+					match = regex_sdPrintingByte.search(line)
+					self._currentFile.setFilepos(int(match.group("current")))
 					self._callback.on_comm_progress()
 				elif 'File opened' in line and not self._ignore_select:
 					# answer to M23, at least on Marlin, Repetier and Sprinter: "File opened:%s Size:%d"
-					match = self._regex_sdFileOpened.search(line)
+					match = regex_sdFileOpened.search(line)
 					if self._sdFileToSelect:
 						name = self._sdFileToSelect
 						self._sdFileToSelect = None
 					else:
-						name = match.group(1)
-					self._currentFile = PrintingSdFileInformation(name, int(match.group(2)))
+						name = match.group("name")
+					self._currentFile = PrintingSdFileInformation(name, int(match.group("size")))
 				elif 'File selected' in line:
 					if self._ignore_select:
 						self._ignore_select = False
@@ -1181,7 +1206,7 @@ class MachineCom(object):
 
 	def _onConnected(self):
 		self._serial.timeout = settings().getFloat(["serial", "timeout", "communication"])
-		self._temperature_timer = RepeatedTimer(lambda: get_interval("temperature"), self._poll_temperature, run_first=True)
+		self._temperature_timer = RepeatedTimer(lambda: get_interval("temperature", default_value=4.0), self._poll_temperature, run_first=True)
 		self._temperature_timer.start()
 
 		self._changeState(self.STATE_OPERATIONAL)
@@ -1241,10 +1266,10 @@ class MachineCom(object):
 				self._changeState(self.STATE_DETECT_SERIAL)
 				serial_obj = self._detectPort(True)
 				if serial_obj is None:
-					self._log("Failed to autodetect serial port")
-					self._errorValue = 'Failed to autodetect serial port.'
+					self._errorValue = 'Failed to autodetect serial port, please set it manually.'
 					self._changeState(self.STATE_ERROR)
 					eventManager().fire(Events.ERROR, {"error": self.getErrorString()})
+					self._log("Failed to autodetect serial port, please set it manually.")
 					return None
 
 				port = serial_obj.port
@@ -1266,11 +1291,17 @@ class MachineCom(object):
 		for name, factory in serial_factories:
 			try:
 				serial_obj = factory(self, self._port, self._baudrate, settings().getFloat(["serial", "timeout", "connection"]))
-			except Exception:
-				self._log("Unexpected error while connecting to serial port: %s %s (hook %s)" % (self._port, get_exception_string(), name))
-				self._errorValue = "Failed to open serial port, permissions correct?"
+			except:
+				exception_string = get_exception_string()
+				self._errorValue = "Connection error, see Terminal tab"
 				self._changeState(self.STATE_ERROR)
 				eventManager().fire(Events.ERROR, {"error": self.getErrorString()})
+
+				self._log("Unexpected error while connecting to serial port: %s %s (hook %s)" % (self._port, exception_string, name))
+
+				if "failed to set custom baud rate" in exception_string.lower():
+					self._log("Your installation does not support custom baudrates (e.g. 250000) for connecting to your printer. This is a problem of the pyserial library that OctoPrint depends on. Please update to a pyserial version that supports your baudrate or switch your printer's firmware to a standard baudrate (e.g. 115200). See https://github.com/foosel/OctoPrint/wiki/OctoPrint-support-for-250000-baud-rate-on-Raspbian")
+
 				return False
 
 			if serial_obj is not None:
@@ -1289,12 +1320,16 @@ class MachineCom(object):
 			# Marlin reports an MIN/MAX temp error as "Error:x\n: Extruder switched off. MAXTEMP triggered !\n"
 			#	But a bed temp error is reported as "Error: Temperature heated bed switched off. MAXTEMP triggered !!"
 			#	So we can have an extra newline in the most common case. Awesome work people.
-			if self._regex_minMaxError.match(line):
+			if regex_minMaxError.match(line):
 				line = line.rstrip() + self._readline()
 
-			#Skip the communication errors, as those get corrected.
-			if 'line number' in line.lower() or 'checksum' in line.lower() or 'expected line' in line.lower():
+			if 'line number' in line.lower() or 'checksum' in line.lower() or 'format error' in line.lower() or 'expected line' in line.lower():
+				#Skip the communication errors, as those get corrected.
 				self._lastCommError = line[6:] if line.startswith("Error:") else line[2:]
+				pass
+			elif 'volume.init' in line.lower() or "openroot" in line.lower() or 'workdir' in line.lower()\
+					or "error writing to file" in line.lower():
+				#Also skip errors with the SD card
 				pass
 			elif not self.isError():
 				self._errorValue = line[6:] if line.startswith("Error:") else line[2:]
@@ -1303,14 +1338,17 @@ class MachineCom(object):
 		return line
 
 	def _readline(self):
-		if self._serial == None:
+		if self._serial is None:
 			return None
+
 		try:
 			ret = self._serial.readline()
 		except:
-			self._log("Unexpected error while reading serial port: %s" % (get_exception_string()))
-			self._errorValue = get_exception_string()
-			self.close(True)
+			if not self._connection_closing:
+				self._logger.exception("Unexpected error while reading from serial port")
+				self._log("Unexpected error while reading serial port, please consult octoprint.log for details: %s" % (get_exception_string()))
+				self._errorValue = get_exception_string()
+				self.close(True)
 			return None
 		if ret == '':
 			#self._log("Recv: TIMEOUT")
@@ -1387,9 +1425,18 @@ class MachineCom(object):
 				self._currentResendCount += 1
 				return
 
+			# If we ignore resend repetitions (Repetier firmware...), check if we
+			# need to do this now. If the same line number has been requested we
+			# already saw and resent, we'll ignore it up to <counter> times.
+			if self._resendSwallowRepetitions and lineToResend == self._lastResendNumber and self._resendSwallowRepetitionsCounter > 0:
+				self._logger.debug("Ignoring resend request for line %d, that is probably a repetition sent by the firmware to ensure it arrives, not a real request" % lineToResend)
+				self._resendSwallowRepetitionsCounter -= 1
+				return
+
 			self._resendDelta = resendDelta
 			self._lastResendNumber = lineToResend
 			self._currentResendCount = 0
+			self._resendSwallowRepetitionsCounter = settings().getInt(["feature", "identicalResendsCountdown"])
 
 			if self._resendDelta > len(self._lastLines) or len(self._lastLines) == 0 or self._resendDelta < 0:
 				self._errorValue = "Printer requested line %d but no sufficient history is available, can't resend" % lineToResend
@@ -1446,25 +1493,6 @@ class MachineCom(object):
 				# trigger the "queued" phase only if we are not streaming to sd right now
 				self._process_command_phase("queued", cmd, cmd_type, gcode=gcode)
 
-	def gcode_command_for_cmd(self, cmd):
-		"""
-		Tries to parse the provided ``cmd`` and extract the GCODE command identifier from it (e.g. "G0" for "G0 X10.0").
-
-		Arguments:
-		    cmd (str): The command to try to parse.
-
-		Returns:
-		    str or None: The GCODE command identifier if it could be parsed, or None if not.
-		"""
-		if not cmd:
-			return None
-
-		gcode = self._regex_command.search(cmd)
-		if not gcode:
-			return None
-
-		return gcode.group(1)
-
 	##~~ send loop handling
 
 	def _enqueue_for_sending(self, command, linenumber=None, command_type=None):
@@ -1505,7 +1533,7 @@ class MachineCom(object):
 				# some firmwares (e.g. Smoothie) might support additional in-band communication that will not
 				# stick to the acknowledgement behaviour of GCODE, so we check here if we have a GCODE command
 				# at hand here and only clear our clear_to_send flag later if that's the case
-				gcode = self.gcode_command_for_cmd(command)
+				gcode = gcode_command_for_cmd(command)
 
 				if linenumber is not None:
 					# line number predetermined - this only happens for resends, so we'll use the number and
@@ -1522,10 +1550,7 @@ class MachineCom(object):
 
 					# now comes the part where we increase line numbers and send stuff - no turning back now
 					if (gcode is not None or self._sendChecksumWithUnknownCommands) and (self.isPrinting() or self._alwaysSendChecksum):
-						linenumber = self._currentLine
-						self._addToLastLines(command)
-						self._currentLine += 1
-						self._doSendWithChecksum(command, linenumber)
+						self._doIncrementAndSendWithChecksum(command)
 					else:
 						self._doSendWithoutChecksum(command)
 
@@ -1553,7 +1578,7 @@ class MachineCom(object):
 			return command, command_type, gcode
 
 		if gcode is None:
-			gcode = self.gcode_command_for_cmd(command)
+			gcode = gcode_command_for_cmd(command)
 
 		# send it through the phase specific handlers provided by plugins
 		for name, hook in self._gcode_hooks[phase].items():
@@ -1608,10 +1633,17 @@ class MachineCom(object):
 			# handler returned a tuple of an unexpected length
 			return original_tuple
 
-		gcode = self.gcode_command_for_cmd(command)
+		gcode = gcode_command_for_cmd(command)
 		return command, command_type, gcode
 
 	##~~ actual sending via serial
+
+	def _doIncrementAndSendWithChecksum(self, cmd):
+		with self._line_mutex:
+			linenumber = self._currentLine
+			self._addToLastLines(cmd)
+			self._currentLine += 1
+			self._doSendWithChecksum(cmd, linenumber)
 
 	def _doSendWithChecksum(self, cmd, lineNumber):
 		commandToSend = "N%d %s" % (lineNumber, cmd)
@@ -1620,6 +1652,9 @@ class MachineCom(object):
 		self._doSendWithoutChecksum(commandToSend)
 
 	def _doSendWithoutChecksum(self, cmd):
+		if self._serial is None:
+			return
+
 		self._log("Send: %s" % cmd)
 		try:
 			self._serial.write(cmd + '\n')
@@ -1628,27 +1663,31 @@ class MachineCom(object):
 			try:
 				self._serial.write(cmd + '\n')
 			except:
-				self._log("Unexpected error while writing serial port: %s" % (get_exception_string()))
+				if not self._connection_closing:
+					self._logger.exception("Unexpected error while writing to serial port")
+					self._log("Unexpected error while writing to serial port: %s" % (get_exception_string()))
+					self._errorValue = get_exception_string()
+					self.close(True)
+		except:
+			if not self._connection_closing:
+				self._logger.exception("Unexpected error while writing to serial port")
+				self._log("Unexpected error while writing to serial port: %s" % (get_exception_string()))
 				self._errorValue = get_exception_string()
 				self.close(True)
-		except:
-			self._log("Unexpected error while writing serial port: %s" % (get_exception_string()))
-			self._errorValue = get_exception_string()
-			self.close(True)
 
 	##~~ command handlers
 
 	def _gcode_T_sent(self, cmd, cmd_type=None):
-		toolMatch = self._regex_paramTInt.search(cmd)
+		toolMatch = regexes_parameters["intT"].search(cmd)
 		if toolMatch:
-			self._currentTool = int(toolMatch.group(1))
+			self._currentTool = int(toolMatch.group("value"))
 
 	def _gcode_G0_sent(self, cmd, cmd_type=None):
 		if 'Z' in cmd:
-			match = self._regex_paramZFloat.search(cmd)
+			match = regexes_parameters["floatZ"].search(cmd)
 			if match:
 				try:
-					z = float(match.group(1))
+					z = float(match.group("value"))
 					if self._currentZ != z:
 						self._currentZ = z
 						self._callback.on_comm_z_change(z)
@@ -1663,13 +1702,13 @@ class MachineCom(object):
 
 	def _gcode_M104_sent(self, cmd, cmd_type=None):
 		toolNum = self._currentTool
-		toolMatch = self._regex_paramTInt.search(cmd)
+		toolMatch = regexes_parameters["intT"].search(cmd)
 		if toolMatch:
-			toolNum = int(toolMatch.group(1))
-		match = self._regex_paramSInt.search(cmd)
+			toolNum = int(toolMatch.group("value"))
+		match = regexes_parameters["floatS"].search(cmd)
 		if match:
 			try:
-				target = float(match.group(1))
+				target = float(match.group("value"))
 				if toolNum in self._temp.keys() and self._temp[toolNum] is not None and isinstance(self._temp[toolNum], tuple):
 					(actual, oldTarget) = self._temp[toolNum]
 					self._temp[toolNum] = (actual, target)
@@ -1679,10 +1718,10 @@ class MachineCom(object):
 				pass
 
 	def _gcode_M140_sent(self, cmd, cmd_type=None):
-		match = self._regex_paramSInt.search(cmd)
+		match = regexes_parameters["floatS"].search(cmd)
 		if match:
 			try:
-				target = float(match.group(1))
+				target = float(match.group("value"))
 				if self._bedTemp is not None and isinstance(self._bedTemp, tuple):
 					(actual, oldTarget) = self._bedTemp
 					self._bedTemp = (actual, target)
@@ -1705,37 +1744,61 @@ class MachineCom(object):
 
 	def _gcode_M110_sending(self, cmd, cmd_type=None):
 		newLineNumber = None
-		match = self._regex_paramNInt.search(cmd)
+		match = regexes_parameters["intN"].search(cmd)
 		if match:
 			try:
-				newLineNumber = int(match.group(1))
+				newLineNumber = int(match.group("value"))
 			except:
 				pass
 		else:
 			newLineNumber = 0
 
-		# send M110 command with new line number
-		self._currentLine = newLineNumber
+		with self._line_mutex:
+			# send M110 command with new line number
+			self._currentLine = newLineNumber
 
-		# after a reset of the line number we have no way to determine what line exactly the printer now wants
-		self._lastLines.clear()
+			# after a reset of the line number we have no way to determine what line exactly the printer now wants
+			self._lastLines.clear()
 		self._resendDelta = None
 
-	def _gcode_M112_queuing(self, cmd, cmd_type=None): # It's an emergency what todo? Canceling the print should be the minimum
-		self.cancelPrint()
+	def _gcode_M112_queuing(self, cmd, cmd_type=None):
+		# emergency stop, jump the queue with the M112
+		self._doSendWithoutChecksum("M112")
+		self._doIncrementAndSendWithChecksum("M112")
+
+		# No idea if the printer is still listening or if M112 won. Just in case
+		# we'll now try to also manually make sure all heaters are shut off - better
+		# safe than sorry. We do this ignoring the queue since at this point it
+		# is irrelevant whether the printer has sent enough ack's or not, we
+		# are going to shutdown the connection in a second anyhow.
+		for tool in range(self._printerProfileManager.get_current_or_default()["extruder"]["count"]):
+			self._doIncrementAndSendWithChecksum("M104 T{tool} S0".format(tool=tool))
+		self._doIncrementAndSendWithChecksum("M140 S0")
+
+		# close to reset host state
+		self._errorValue = "Closing serial port due to emergency stop M112."
+		self._log(self._errorValue)
+		self.close(isError=True)
+
+		# fire the M112 event since we sent it and we're going to prevent the caller from seeing it
+		gcode = "M112"
+		if gcode in gcodeToEvent:
+			eventManager().fire(gcodeToEvent[gcode])
+
+		# return None 1-tuple to eat the one that is queuing because we don't want to send it twice
+		# I hope it got it the first time because as far as I can tell, there is no way to know
+		return None,
 
 	def _gcode_G4_sent(self, cmd, cmd_type=None):
 		# we are intending to dwell for a period of time, increase the timeout to match
-		cmd = cmd.upper()
-		p_idx = cmd.find('P')
-		s_idx = cmd.find('S')
+		p_match = regexes_parameters["floatP"].search(cmd)
+		s_match = regexes_parameters["floatS"].search(cmd)
+
 		_timeout = 0
-		if p_idx != -1:
-			# dwell time is specified in milliseconds
-			_timeout = float(cmd[p_idx+1:]) / 1000.0
-		elif s_idx != -1:
-			# dwell time is specified in seconds
-			_timeout = float(cmd[s_idx+1:])
+		if p_match:
+			_timeout = float(p_match.group("value")) / 1000.0
+		elif s_match:
+			_timeout = float(s_match.group("value"))
 		self._timeout = get_new_timeout("communication") + _timeout
 
 	##~~ command phase handlers
@@ -1976,9 +2039,9 @@ class TypedQueue(queue.Queue):
 		return item
 
 
-class TypeAlreadyInQueue(BaseException):
+class TypeAlreadyInQueue(Exception):
 	def __init__(self, t, *args, **kwargs):
-		BaseException.__init__(self, *args, **kwargs)
+		Exception.__init__(self, *args, **kwargs)
 		self.type = t
 
 
@@ -1987,11 +2050,15 @@ def get_new_timeout(type):
 	return now + get_interval(type)
 
 
-def get_interval(type):
+def get_interval(type, default_value=0.0):
 	if type not in default_settings["serial"]["timeout"]:
-		return 0
+		return default_value
 	else:
-		return settings().getFloat(["serial", "timeout", type])
+		value = settings().getFloat(["serial", "timeout", type])
+		if not value:
+			return default_value
+		else:
+			return value
 
 _temp_command_regex = re.compile("^M(?P<command>104|109|140|190)(\s+T(?P<tool>\d+)|\s+S(?P<temperature>[-+]?\d*\.?\d*))+")
 
@@ -2120,4 +2187,160 @@ def convert_feedback_controls(configured_controls):
 	feedback_matcher = re.compile("|".join(feedback_pattern))
 
 	return feedback_controls, feedback_matcher
+
+def canonicalize_temperatures(parsed, current):
+	"""
+	Canonicalizes the temperatures provided in parsed.
+
+	Will make sure that returned result only contains extruder keys
+	like Tn, so always qualified with a tool number.
+
+	The algorithm for cleaning up the parsed keys is the following:
+
+	  * If ``T`` is not included with the reported extruders, return
+	  * If more than just ``T`` is reported:
+	    * If both ``T`` and ``T0`` are reported set ``Tc`` to ``T``, remove
+	      ``T`` from the result.
+	    * Else set ``T0`` to ``T`` and delete ``T`` (Smoothie extra).
+	  * If only ``T`` is reported, set ``Tc`` to ``T`` and delete ``T``
+	  * return
+
+	Arguments:
+	    parsed (dict): the parsed temperatures (mapping tool => (actual, target))
+	      to canonicalize
+	    current (int): the current active extruder
+	Returns:
+	    dict: the canonicalized version of ``parsed``
+	"""
+
+	reported_extruders = filter(lambda x: x.startswith("T"), parsed.keys())
+	if not "T" in reported_extruders:
+		# Our reported_extruders are either empty or consist purely
+		# of Tn keys, no need for any action
+		return parsed
+
+	current_tool_key = "T%d" % current
+	result = dict(parsed)
+
+	if len(reported_extruders) > 1:
+		if "T0" in reported_extruders:
+			# Both T and T0 are present, so T contains the current
+			# extruder's temperature, e.g. for current_tool == 1:
+			#
+			#     T:<T1> T0:<T0> T2:<T2> ... B:<B>
+			#
+			# becomes
+			#
+			#     T0:<T1> T1:<T1> T2:<T2> ... B:<B>
+			#
+			# Same goes if Tc is already present, it will be overwritten:
+			#
+			#     T:<T1> T0:<T0> T1:<T1> T2:<T2> ... B:<B>
+			#
+			# becomes
+			#
+			#     T0:<T0> T1:<T1> T2:<T2> ... B:<B>
+			result[current_tool_key] = result["T"]
+			del result["T"]
+		else:
+			# So T is there, but T0 isn't. That looks like Smoothieware which
+			# always reports the first extruder T0 as T:
+			#
+			#     T:<T0> T1:<T1> T2:<T2> ... B:<B>
+			#
+			# becomes
+			#
+			#     T0:<T0> T1:<T1> T2:<T2> ... B:<B>
+			result["T0"] = result["T"]
+			del result["T"]
+
+	else:
+		# We only have T. That can mean two things:
+		#
+		#   * we only have one extruder at all, or
+		#   * we are currently parsing a response to M109/M190, which on
+		#     some firmwares doesn't report the full M105 output while
+		#     waiting for the target temperature to be reached but only
+		#     reports the current tool and bed
+		#
+		# In both cases it is however safe to just move our T over
+		# to T<current> in the parsed data, current should always stay
+		# 0 for single extruder printers. E.g. for current_tool == 1:
+		#
+		#     T:<T1>
+		#
+		# becomes
+		#
+		#     T1:<T1>
+
+		result[current_tool_key] = result["T"]
+		del result["T"]
+
+	return result
+
+def parse_temperature_line(line, current):
+	"""
+	Parses the provided temperature line.
+
+	The result will be a dictionary mapping from the extruder or bed key to
+	a tuple with current and target temperature. The result will be canonicalized
+	with :func:`canonicalize_temperatures` before returning.
+
+	Arguments:
+	    line (str): the temperature line to parse
+	    current (int): the current active extruder
+
+	Returns:
+	    tuple: a 2-tuple with the maximum tool number and a dict mapping from
+	      key to (actual, target) tuples, with key either matching ``Tn`` for ``n >= 0`` or ``B``
+	"""
+
+	result = {}
+	maxToolNum = 0
+	for match in re.finditer(regex_temp, line):
+		values = match.groupdict()
+		tool = values["tool"]
+		toolnum = values.get("toolnum", None)
+		toolNumber = int(toolnum) if toolnum is not None and len(toolnum) else None
+		if toolNumber > maxToolNum:
+			maxToolNum = toolNumber
+
+		try:
+			actual = float(match.group(3))
+			target = None
+			if match.group(4) and match.group(5):
+				target = float(match.group(5))
+
+			result[tool] = (actual, target)
+		except ValueError:
+			# catch conversion issues, we'll rather just not get the temperature update instead of killing the connection
+			pass
+
+	return max(maxToolNum, current), canonicalize_temperatures(result, current)
+
+def gcode_command_for_cmd(cmd):
+	"""
+	Tries to parse the provided ``cmd`` and extract the GCODE command identifier from it (e.g. "G0" for "G0 X10.0").
+
+	Arguments:
+	    cmd (str): The command to try to parse.
+
+	Returns:
+	    str or None: The GCODE command identifier if it could be parsed, or None if not.
+	"""
+	if not cmd:
+		return None
+
+	gcode = regex_command.search(cmd)
+	if not gcode:
+		return None
+
+	values = gcode.groupdict()
+	if "commandGM" in values and values["commandGM"]:
+		return values["commandGM"]
+	elif "commandT" in values and values["commandT"]:
+		return values["commandT"]
+	else:
+		# this should never happen
+		return None
 

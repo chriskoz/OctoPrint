@@ -13,11 +13,19 @@ $(function() {
 
         self.currentlyBeingUpdated = [];
 
-        self.config_restartCommand = ko.observable();
-        self.config_rebootCommand = ko.observable();
+        self.octoprintUnconfigured = ko.observable();
+        self.octoprintUnreleased = ko.observable();
+
         self.config_cacheTtl = ko.observable();
+        self.config_checkoutFolder = ko.observable();
+        self.config_checkType = ko.observable();
 
         self.configurationDialog = $("#settings_plugin_softwareupdate_configurationdialog");
+
+        self.config_availableCheckTypes = [
+            {"key": "github_release", "name": gettext("Release")},
+            {"key": "git_commit", "name": gettext("Commit")}
+        ];
 
         self.versions = new ItemListHelper(
             "plugin.softwareupdate.versions",
@@ -44,9 +52,7 @@ $(function() {
         };
 
         self._showPopup = function(options, eventListeners) {
-            if (self.popup !== undefined) {
-                self.popup.remove();
-            }
+            self._closePopup();
             self.popup = new PNotify(options);
 
             if (eventListeners) {
@@ -65,6 +71,12 @@ $(function() {
             }
         };
 
+        self._closePopup = function() {
+            if (self.popup !== undefined) {
+                self.popup.remove();
+            }
+        };
+
         self.showPluginSettings = function() {
             self._copyConfig();
             self.configurationDialog.modal();
@@ -74,19 +86,122 @@ $(function() {
             var data = {
                 plugins: {
                     softwareupdate: {
-                        octoprint_restart_command: self.config_restartCommand(),
-                        environment_restart_command: self.config_rebootCommand(),
-                        cache_ttl: parseInt(self.config_cacheTtl())
+                        cache_ttl: parseInt(self.config_cacheTtl()),
+                        octoprint_checkout_folder: self.config_checkoutFolder(),
+                        octoprint_type: self.config_checkType()
                     }
                 }
             };
-            self.settings.saveData(data, function() { self.configurationDialog.modal("hide"); self._copyConfig(); });
+            self.settings.saveData(data, function() {
+                self.configurationDialog.modal("hide");
+                self._copyConfig();
+                self.performCheck();
+            });
         };
 
         self._copyConfig = function() {
-            self.config_restartCommand(self.settings.settings.plugins.softwareupdate.octoprint_restart_command());
-            self.config_rebootCommand(self.settings.settings.plugins.softwareupdate.environment_restart_command());
             self.config_cacheTtl(self.settings.settings.plugins.softwareupdate.cache_ttl());
+            self.config_checkoutFolder(self.settings.settings.plugins.softwareupdate.octoprint_checkout_folder());
+            self.config_checkType(self.settings.settings.plugins.softwareupdate.octoprint_type());
+        };
+
+        self.fromCheckResponse = function(data, ignoreSeen, showIfNothingNew) {
+            var versions = [];
+            _.each(data.information, function(value, key) {
+                value["key"] = key;
+
+                if (!value.hasOwnProperty("displayName") || value.displayName == "") {
+                    value.displayName = value.key;
+                }
+                if (!value.hasOwnProperty("displayVersion") || value.displayVersion == "") {
+                    value.displayVersion = value.information.local.name;
+                }
+
+                versions.push(value);
+            });
+            self.versions.updateItems(versions);
+
+            var octoprint = data.information["octoprint"];
+            if (octoprint && octoprint.hasOwnProperty("check")) {
+                var check = octoprint.check;
+                if (BRANCH != "master" && check["type"] == "github_release") {
+                    self.octoprintUnreleased(true);
+                } else {
+                    self.octoprintUnreleased(false);
+                }
+
+                var checkoutFolder = (check["checkout_folder"] || "").trim();
+                var updateFolder = (check["update_folder"] || "").trim();
+                var checkType = check["type"] || "";
+                if ((checkType == "github_release" || checkType == "git_commit") && checkoutFolder == "" && updateFolder == "") {
+                    self.octoprintUnconfigured(true);
+                } else {
+                    self.octoprintUnconfigured(false);
+                }
+            }
+
+            if (data.status == "updateAvailable" || data.status == "updatePossible") {
+                var text = gettext("There are updates available for the following components:");
+
+                text += "<ul>";
+                _.each(self.versions.items(), function(update_info) {
+                    if (update_info.updateAvailable) {
+                        var displayName = update_info.key;
+                        if (update_info.hasOwnProperty("displayName")) {
+                            displayName = update_info.displayName;
+                        }
+                        text += "<li>" + displayName + (update_info.updatePossible ? " <i class=\"icon-ok\"></i>" : "") + "</li>";
+                    }
+                });
+                text += "</ul>";
+
+                text += "<small>" + gettext("Those components marked with <i class=\"icon-ok\"></i> can be updated directly.") + "</small>";
+
+                var options = {
+                    title: gettext("Update Available"),
+                    text: text,
+                    hide: false
+                };
+                var eventListeners = {};
+
+                if (data.status == "updatePossible" && self.loginState.isAdmin()) {
+                    // if user is admin, add action buttons
+                    options["confirm"] = {
+                        confirm: true,
+                        buttons: [{
+                            text: gettext("Ignore"),
+                            click: function() {
+                                self._markNotificationAsSeen(data.information);
+                                self._showPopup({
+                                    text: gettext("You can make this message display again via \"Settings\" > \"Software Update\" > \"Check for update now\"")
+                                });
+                            }
+                        }, {
+                            text: gettext("Update now"),
+                            addClass: "btn-primary",
+                            click: self.update
+                        }]
+                    };
+                    options["buttons"] = {
+                        closer: false,
+                        sticker: false
+                    };
+                }
+
+                if (ignoreSeen || !self._hasNotificationBeenSeen(data.information)) {
+                    self._showPopup(options, eventListeners);
+                }
+            } else if (data.status == "current") {
+                if (showIfNothingNew) {
+                    self._showPopup({
+                        title: gettext("Everything is up-to-date"),
+                        hide: false,
+                        type: "success"
+                    });
+                } else {
+                    self._closePopup();
+                }
+            }
         };
 
         self.performCheck = function(showIfNothingNew, force, ignoreSeen) {
@@ -102,79 +217,7 @@ $(function() {
                 type: "GET",
                 dataType: "json",
                 success: function(data) {
-                    var versions = [];
-                    _.each(data.information, function(value, key) {
-                        value["key"] = key;
-
-                        if (!value.hasOwnProperty("displayName") || value.displayName == "") {
-                            value.displayName = value.key;
-                        }
-                        if (!value.hasOwnProperty("displayVersion") || value.displayVersion == "") {
-                            value.displayVersion = value.information.local.name;
-                        }
-
-                        versions.push(value);
-                    });
-                    self.versions.updateItems(versions);
-
-                    if (data.status == "updateAvailable" || data.status == "updatePossible") {
-                        var text = gettext("There are updates available for the following components:");
-
-                        text += "<ul>";
-                        _.each(self.versions.items(), function(update_info) {
-                            if (update_info.updateAvailable) {
-                                var displayName = update_info.key;
-                                if (update_info.hasOwnProperty("displayName")) {
-                                    displayName = update_info.displayName;
-                                }
-                                text += "<li>" + displayName + (update_info.updatePossible ? " <i class=\"icon-ok\"></i>" : "") + "</li>";
-                            }
-                        });
-                        text += "</ul>";
-
-                        text += "<small>" + gettext("Those components marked with <i class=\"icon-ok\"></i> can be updated directly.") + "</small>";
-
-                        var options = {
-                            title: gettext("Update Available"),
-                            text: text,
-                            hide: false
-                        };
-                        var eventListeners = {};
-
-                        if (data.status == "updatePossible" && self.loginState.isAdmin()) {
-                            // if user is admin, add action buttons
-                            options["confirm"] = {
-                                confirm: true,
-                                buttons: [{
-                                    text: gettext("Ignore"),
-                                    click: function() {
-                                        self._markNotificationAsSeen(data.information);
-                                        self._showPopup({
-                                            text: gettext("You can make this message display again via \"Settings\" > \"SoftwareUpdate\" > \"Check for update now\"")
-                                        });
-                                    }
-                                }, {
-                                    text: gettext("Update now"),
-                                    addClass: "btn-primary",
-                                    click: self.update
-                                }]
-                            };
-                            options["buttons"] = {
-                                closer: false,
-                                sticker: false
-                            };
-                        }
-
-                        if (ignoreSeen || !self._hasNotificationBeenSeen(data.information)) {
-                            self._showPopup(options, eventListeners);
-                        }
-                    } else if (data.status == "current" && showIfNothingNew) {
-                        self._showPopup({
-                            title: gettext("Everything is up-to-date"),
-                            hide: false,
-                            type: "success"
-                        });
-                    }
+                    self.fromCheckResponse(data, ignoreSeen, showIfNothingNew);
                 }
             });
         };
@@ -419,6 +462,10 @@ $(function() {
                         }
                     });
                     self.updateInProgress = false;
+                    break;
+                }
+                case "update_versions": {
+                    self.performCheck();
                     break;
                 }
             }

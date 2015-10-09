@@ -281,6 +281,7 @@ class PluginSettings(object):
 			defaults = dict()
 		self.defaults = dict(plugins=dict())
 		self.defaults["plugins"][plugin_key] = defaults
+		self.defaults["plugins"][plugin_key]["_config_version"] = None
 
 		if get_preprocessors is None:
 			get_preprocessors = dict()
@@ -309,11 +310,17 @@ class PluginSettings(object):
 			return result
 
 		def add_getter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.get_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.get_preprocessors)
 			return kwargs
 
 		def add_setter_kwargs(kwargs):
-			kwargs.update(defaults=self.defaults, preprocessors=self.set_preprocessors)
+			if not "defaults" in kwargs:
+				kwargs.update(defaults=self.defaults)
+			if not "preprocessors" in kwargs:
+				kwargs.update(preprocessors=self.set_preprocessors)
 			return kwargs
 
 		self.access_methods = dict(
@@ -418,6 +425,15 @@ class PluginSettings(object):
 			filename += "_" + postfix
 		filename += ".log"
 		return os.path.join(self.settings.getBaseFolder("logs"), filename)
+
+	@deprecated("PluginSettings.get_plugin_data_folder has been replaced by OctoPrintPlugin.get_plugin_data_folder",
+	            includedoc="Replaced by :func:`~octoprint.plugin.types.OctoPrintPlugin.get_plugin_data_folder`",
+	            since="1.2.0")
+	def get_plugin_data_folder(self):
+		path = os.path.join(self.settings.getBaseFolder("data"), self.plugin_key)
+		if not os.path.isdir(path):
+			os.makedirs(path)
+		return path
 
 	def __getattr__(self, item):
 		all_access_methods = self.access_methods.keys() + self.deprecated_access_methods.keys()

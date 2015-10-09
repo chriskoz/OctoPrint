@@ -155,12 +155,14 @@ $(function() {
         self.performRepositorySearch = function() {
             var query = self.repositorySearchQuery();
             if (query !== undefined && query.trim() != "") {
+                query = query.toLocaleLowerCase();
                 self.repositoryplugins.changeSearchFunction(function(entry) {
                     return entry && (entry["title"].toLocaleLowerCase().indexOf(query) > -1 || entry["description"].toLocaleLowerCase().indexOf(query) > -1);
                 });
             } else {
                 self.repositoryplugins.resetSearch();
             }
+            return false;
         };
 
         self.fromResponse = function(data) {
@@ -511,11 +513,22 @@ $(function() {
 
                 var name = "Unknown";
                 if (action == "install") {
+                    var unknown = false;
+
                     if (data.hasOwnProperty("plugin")) {
-                        name = data.plugin.name;
+                        if (data.plugin == "unknown") {
+                            unknown = true;
+                        } else {
+                            name = data.plugin.name;
+                        }
                     }
 
-                    if (data.was_reinstalled) {
+                    if (unknown) {
+                        titleSuccess = _.sprintf(gettext("Plugin installed"));
+                        textSuccess = gettext("A plugin was installed successfully, however it was impossible to detect which one. Please Restart OctoPrint to make sure everything will be registered properly");
+                        textRestart = textSuccess;
+                        textReload = textSuccess;
+                    } else if (data.was_reinstalled) {
                         titleSuccess = _.sprintf(gettext("Plugin \"%(name)s\" reinstalled"), {name: name});
                         textSuccess = gettext("The plugin was reinstalled successfully");
                         textRestart = gettext("The plugin was reinstalled successfully, however a restart of OctoPrint is needed for that to take effect.");
